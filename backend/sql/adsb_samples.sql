@@ -1,7 +1,9 @@
 -- ADS-B sample storage (prototype).
 -- Stores aircraft position samples so we can compute "flight exposure" over time.
 --
--- Apply in Supabase SQL editor.
+-- Canonical migration (for CI): supabase/migrations/20260211120000_adsb_samples.sql
+-- Apply manually: paste this file into Supabase SQL Editor, or rely on GitHub Action
+-- "Deploy Supabase migrations" after configuring repository secrets (see README).
 
 create table if not exists public.adsb_samples (
   id bigserial primary key,
@@ -23,4 +25,3 @@ create index if not exists adsb_samples_lat_lng_idx on public.adsb_samples (lat,
 
 -- Optional: de-dupe best-effort (same plane + timestamp + rounded position)
 -- You can add a unique index if you want stricter de-dupe once sampling cadence is known.
-
