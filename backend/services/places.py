@@ -50,9 +50,31 @@ def _haversine_miles(lat1, lng1, lat2, lng2) -> float:
 
 def _miles_to_display(miles: float) -> tuple[float, str]:
     feet = miles * 5280
-    if feet < 2640:
+    if feet < 1000:
         return round(feet), "feet"
     return round(miles, 1), "miles"
+
+
+# Google primary types that count as a restaurant or bar (hotels, piers, venues are excluded).
+_DINING_PRIMARY_TYPES = frozenset({
+    "restaurant", "bar", "pub", "wine_bar", "bar_and_grill", "cocktail_bar", "sports_bar", "lounge_bar",
+    "beer_garden", "beer_hall", "brewpub", "gastropub", "diner", "steak_house", "bistro", "brasserie",
+    "tavern", "food_court",
+})
+
+
+def _is_dining_primary_type(primary_type: object) -> bool:
+    t = str(primary_type or "").strip().lower()
+    return t in _DINING_PRIMARY_TYPES or t.endswith("_restaurant")
+
+
+_GROCERY_PRIMARY_TYPES = frozenset({
+    "supermarket", "grocery_store", "asian_grocery_store", "discount_supermarket", "hypermarket", "food_store",
+})
+_BRAND_STORE_TYPES = _GROCERY_PRIMARY_TYPES | {"department_store", "discount_store"}
+
+# A real retail center has a large review history; small shops are sometimes typed shopping_mall.
+_MIN_MALL_REVIEWS = 500
 
 
 def _is_placeholder(value: str) -> bool:
@@ -69,16 +91,23 @@ def _nearest_static(coord: Coordinate, options: list[dict]) -> dict:
     return min(options, key=lambda p: _haversine_miles(coord.lat, coord.lng, p["lat"], p["lng"]))
 
 
-def _nearby_search(api_key: str, coord: Coordinate, place_types: list[str], radius_m: int = 800) -> dict | None:
-    """Calls Places API (New) Nearby Search. Returns first result or None."""
+# userRatingCount moves a request to Google's pricier Enterprise SKU, so only the mall search asks for it.
+_PLACE_FIELDS = "places.displayName,places.location,places.primaryType"
+
+
+def _nearby_search_all(
+    api_key: str, coord: Coordinate, place_types: list[str], radius_m: int = 800, *,
+    max_results: int = 1, extra_fields: str = "",
+) -> list[dict]:
+    """Places API (New) Nearby Search, nearest first."""
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.location",
+        "X-Goog-FieldMask": _PLACE_FIELDS + (f",{extra_fields}" if extra_fields else ""),
     }
     body = {
         "includedTypes": place_types,
-        "maxResultCount": 1,
+        "maxResultCount": max_results,
         "rankPreference": "DISTANCE",
         "locationRestriction": {
             "circle": {
@@ -90,23 +119,36 @@ def _nearby_search(api_key: str, coord: Coordinate, place_types: list[str], radi
     try:
         resp = requests.post(PLACES_NEARBY_URL, json=body, headers=headers, timeout=10)
         resp.raise_for_status()
-        places = resp.json().get("places", [])
-        return places[0] if places else None
+        return [p for p in resp.json().get("places", []) if isinstance(p, dict)]
     except Exception as e:
         logger.warning(f"Nearby search failed for {place_types}: {e}")
-        return None
+        return []
 
 
-def _text_search(api_key: str, coord: Coordinate, query: str, radius_m: int = 3000) -> dict | None:
-    """Calls Places API (New) Text Search. Returns first result or None."""
+def _nearby_search(api_key: str, coord: Coordinate, place_types: list[str], radius_m: int = 800) -> dict | None:
+    """Nearest result of a Nearby Search, or None."""
+    places = _nearby_search_all(api_key, coord, place_types, radius_m)
+    return places[0] if places else None
+
+
+def _text_search(
+    api_key: str, coord: Coordinate, query: str, radius_m: int = 3000, *, name_contains: str = "",
+    primary_types: frozenset[str] | None = None,
+) -> dict | None:
+    """Places API (New) Text Search; nearest result whose name contains `name_contains`
+    (and whose primary type is in `primary_types`, when given), or None.
+
+    Text Search returns loosely related places (a "Trader Joe's" query can return a Target),
+    so brand cards require the brand in the name.
+    """
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.location",
+        "X-Goog-FieldMask": _PLACE_FIELDS,
     }
     body = {
         "textQuery": query,
-        "maxResultCount": 1,
+        "maxResultCount": 10,
         "rankPreference": "DISTANCE",
         "locationBias": {
             "circle": {
@@ -118,11 +160,18 @@ def _text_search(api_key: str, coord: Coordinate, query: str, radius_m: int = 30
     try:
         resp = requests.post(PLACES_TEXT_URL, json=body, headers=headers, timeout=10)
         resp.raise_for_status()
-        places = resp.json().get("places", [])
-        return places[0] if places else None
+        places = [p for p in resp.json().get("places", []) if isinstance(p, dict)]
     except Exception as e:
         logger.warning(f"Text search failed for '{query}': {e}")
         return None
+    needle = name_contains.strip().lower()
+    for place in places:
+        name = str((place.get("displayName") or {}).get("text") or "").lower().replace("\u2019", "'")
+        if primary_types is not None and place.get("primaryType") not in primary_types:
+            continue
+        if not needle or needle in name:
+            return place
+    return None
 
 
 def _make_card(place: dict, coord: Coordinate, type_key: str, category: str, emoji: str, color: str) -> LogisticsCard | None:
@@ -142,6 +191,15 @@ def _make_card(place: dict, coord: Coordinate, type_key: str, category: str, emo
         color=color,
         coordinates=Coordinate(lat=p_lat, lng=p_lng),
     )
+
+
+def _same_place(a: LogisticsCard, b: LogisticsCard) -> bool:
+    """Same name, or within ~30 m (Text Search can return a store already found by type)."""
+    if a.name.strip().lower() == b.name.strip().lower():
+        return True
+    if a.coordinates and b.coordinates:
+        return _haversine_miles(a.coordinates.lat, a.coordinates.lng, b.coordinates.lat, b.coordinates.lng) < 0.02
+    return False
 
 
 def _get_logistics_sync(coord: Coordinate) -> list[LogisticsCard]:
@@ -222,7 +280,9 @@ def _get_top_restaurants_bars_yelp(coord: Coordinate, api_key: str, *, limit: in
         resp.raise_for_status()
         businesses = resp.json().get("businesses") or []
     except Exception as e:
-        logger.warning("Yelp dining lookup failed: %s", e)
+        # The exception text includes the request URL, which carries the scan's latitude and longitude.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        logger.warning("Yelp dining lookup failed: %s", f"HTTP {status}" if status else type(e).__name__)
         return []
 
     cards: list[RestaurantBarCard] = []
@@ -274,7 +334,7 @@ def _get_top_restaurants_bars_google(coord: Coordinate, api_key: str, *, limit: 
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
         "X-Goog-FieldMask": (
-            "places.displayName,places.location,places.rating,places.userRatingCount,"
+            "places.displayName,places.location,places.rating,places.userRatingCount,places.primaryType,"
             "places.primaryTypeDisplayName,places.types,places.googleMapsUri,places.priceLevel,places.businessStatus"
         ),
     }
@@ -303,6 +363,8 @@ def _get_top_restaurants_bars_google(coord: Coordinate, api_key: str, *, limit: 
         if not isinstance(place, dict):
             continue
         if place.get("businessStatus") and place.get("businessStatus") != "OPERATIONAL":
+            continue
+        if not _is_dining_primary_type(place.get("primaryType")):
             continue
         loc = place.get("location") if isinstance(place.get("location"), dict) else {}
         p_lat = loc.get("latitude")
@@ -387,23 +449,31 @@ def _get_logistics_blocking_inner(coord: Coordinate) -> list[LogisticsCard]:
     if card:
         cards.append(card)
 
-    # --- Grocery Store ---
-    place = _nearby_search(api_key, coord, ["supermarket", "grocery_store"], radius_m=1500)
+    # --- Grocery Store (a building or gas station that contains one also matches the search) ---
+    place = next(
+        (
+            p for p in _nearby_search_all(
+                api_key, coord, ["supermarket", "grocery_store"], radius_m=1500, max_results=10,
+            )
+            if p.get("primaryType") in _GROCERY_PRIMARY_TYPES
+        ),
+        None,
+    )
     card = _make_card(place, coord, "grocery", "Grocery", "🛒", "#3b82f6")
     if card:
         cards.append(card)
 
-    # --- Target ---
-    place = _text_search(api_key, coord, "Target store", radius_m=4000)
-    card = _make_card(place, coord, "targetstore", "Grocery", "🎯", "#ef4444")
-    if card:
-        cards.append(card)
-
-    # --- Trader Joe's ---
-    place = _text_search(api_key, coord, "Trader Joe's grocery", radius_m=4000)
-    card = _make_card(place, coord, "traderjoes", "Grocery", "🥑", "#f97316")
-    if card:
-        cards.append(card)
+    # --- Target / Trader Joe's (brand must be in the name, and a store rather than a listing inside
+    # one such as "Target Mobile" or the small "Trader Joe's Pronto"; skip a place already shown) ---
+    for query, brand, type_key, emoji, color in (
+        ("Target store", "target", "targetstore", "🎯", "#ef4444"),
+        ("Trader Joe's grocery", "trader joe's", "traderjoes", "🥑", "#f97316"),
+    ):
+        place = _text_search(api_key, coord, query, radius_m=4000, name_contains=brand,
+                             primary_types=_BRAND_STORE_TYPES)
+        card = _make_card(place, coord, type_key, "Grocery", emoji, color)
+        if card and not any(_same_place(card, c) for c in cards):
+            cards.append(card)
 
     # --- Nearest Airport (static math) ---
     airport = _nearest_static(coord, NYC_AIRPORTS)
@@ -416,9 +486,15 @@ def _get_logistics_blocking_inner(coord: Coordinate) -> list[LogisticsCard]:
     ))
 
     # --- Nearest mall / retail hub (Places — not limited to static list below) ---
-    place = _nearby_search(api_key, coord, ["shopping_mall"], radius_m=15000)
-    if not place:
-        place = _text_search(api_key, coord, "shopping mall", radius_m=12000)
+    place = next(
+        (
+            p for p in _nearby_search_all(
+                api_key, coord, ["shopping_mall"], radius_m=15000, max_results=20, extra_fields="places.userRatingCount",
+            )
+            if p.get("primaryType") == "shopping_mall" and int(p.get("userRatingCount") or 0) >= _MIN_MALL_REVIEWS
+        ),
+        None,
+    )
     if place:
         card = _make_card(place, coord, "mall", "Retail Center", "🛍️", "#06b6d4")
         if card:

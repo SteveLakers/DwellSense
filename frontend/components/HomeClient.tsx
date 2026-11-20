@@ -1,27 +1,36 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback, type ReactNode } from "react";
 import HeroSection from "@/components/HeroSection";
-import LoadingAd from "@/components/LoadingAd";
+import { HOME_RESET_EVENT } from "@/components/HomeLink";
+import HomeSections from "@/components/HomeSections";
 import ResultsDashboard from "@/components/ResultsDashboard";
+import ScanLoading from "@/components/ScanLoading";
+import { SAMPLE_ADDRESS } from "@/lib/site";
 import { ScanResult } from "@/lib/types";
 
 type View = "hero" | "loading" | "results";
 
-export default function HomeClient() {
+export default function HomeClient({ heroAside }: { heroAside?: ReactNode }) {
   const [view, setView] = useState<View>("hero");
   const [result, setResult] = useState<ScanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isApiReady, setIsApiReady] = useState(false);
   const [bulletsRefreshing, setBulletsRefreshing] = useState(false);
+  const [scanAddress, setScanAddress] = useState("");
 
   const pendingResult = useRef<ScanResult | null>(null);
+  // Bumped by every new scan and reset, so a response for a scan the user left is ignored.
+  const scanGeneration = useRef(0);
 
   const handleScan = async (address: string) => {
+    const generation = ++scanGeneration.current;
     setError(null);
     setIsApiReady(false);
+    setScanAddress(address);
     pendingResult.current = null;
     setView("loading");
+    window.scrollTo(0, 0);
 
     try {
       const res = await fetch("/api/scan", {
@@ -32,6 +41,7 @@ export default function HomeClient() {
       });
 
       const data = await res.json();
+      if (generation !== scanGeneration.current) return;
 
       if (!res.ok) {
         throw new Error(data.error || "Scan failed. Please try again.");
@@ -40,28 +50,36 @@ export default function HomeClient() {
       pendingResult.current = data as ScanResult;
       setIsApiReady(true);
     } catch (err) {
+      if (generation !== scanGeneration.current) return;
       const msg = err instanceof Error ? err.message : "Something went wrong.";
       setError(msg);
       setView("hero");
     }
   };
 
-  const handleAdComplete = () => {
+  const handleResultReady = () => {
     if (pendingResult.current) {
       setResult(pendingResult.current);
       setView("results");
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo(0, 0);
     }
   };
 
-  const handleReset = () => {
+  const handleReset = useCallback(() => {
+    scanGeneration.current += 1;
     setResult(null);
+    setError(null);
     setIsApiReady(false);
     setBulletsRefreshing(false);
     pendingResult.current = null;
     setView("hero");
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+    window.scrollTo(0, 0);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener(HOME_RESET_EVENT, handleReset);
+    return () => window.removeEventListener(HOME_RESET_EVENT, handleReset);
+  }, [handleReset]);
 
   useEffect(() => {
     if (view !== "results" || !result) return;
@@ -109,20 +127,19 @@ export default function HomeClient() {
 
   return (
     <>
-      <main className="flex-1 w-full max-w-[1300px] mx-auto flex flex-col items-center px-1.5 sm:px-2 md:px-3 min-[1550px]:px-5 mt-4 relative z-10">
+      <main className="relative z-10 flex w-full flex-1 flex-col">
         {view === "hero" && (
           <>
-            {error && (
-              <div className="w-full max-w-4xl mb-4 bg-rose-950 border border-rose-500/50 rounded-2xl px-6 py-4 text-rose-300 font-bold text-sm fade-in">
-                ⚠️ {error}
-              </div>
-            )}
-            <HeroSection onScan={handleScan} isLoading={false} />
+            <HeroSection onScan={handleScan} isLoading={false} error={error} aside={heroAside} />
+            <HomeSections
+              onSample={() => void handleScan(SAMPLE_ADDRESS)}
+              sampleLabel="Union Square in Manhattan"
+            />
           </>
         )}
 
         {view === "loading" && (
-          <LoadingAd onComplete={handleAdComplete} isApiReady={isApiReady} />
+          <ScanLoading address={scanAddress} onComplete={handleResultReady} isApiReady={isApiReady} />
         )}
 
         {view === "results" && result && (

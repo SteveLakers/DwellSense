@@ -2,7 +2,9 @@
 ZerMap Backend — FastAPI application entry point.
 """
 
+import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -19,14 +21,25 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from routers import health, scan, pdf
 from jobs.daily_refresh import run_all as daily_refresh
+from services import city_data
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO, and Mapbox geocoding URLs contain the address being
+# checked. The privacy page promises addresses are not logged.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("zermap")
 
 scheduler = AsyncIOScheduler()
 
+# One scan runs about 16 blocking lookups at once (asyncio.to_thread). asyncio's default pool stops
+# at 32 threads, so a third scan at the same moment would wait in line, and that wait counts against
+# each city source's 30 s limit (sources would show as unavailable). The work is all network I/O.
+SCAN_THREAD_POOL_SIZE = 96
 
-def _env_flag(name: str) -> bool:
+
+def _env_flag(name: str, default: bool = False) -> bool:
     v = os.getenv(name, "").strip().lower()
+    if not v:
+        return default
     return v in ("1", "true", "yes", "on")
 
 
@@ -43,8 +56,24 @@ async def _adsb_ingest_job() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Schedule daily NYC data refresh at 3:00 AM
-    scheduler.add_job(daily_refresh, "cron", hour=3, minute=0, id="daily_refresh")
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=SCAN_THREAD_POOL_SIZE, thread_name_prefix="zermap")
+    )
+
+    # Nightly NYC Open Data copy into Supabase (the scan's fallback when NYC Open Data is down).
+    # Local dev shares the production database, so local .env sets DAILY_REFRESH_ENABLED=false.
+    daily_refresh_enabled = _env_flag("DAILY_REFRESH_ENABLED", default=True)
+    if daily_refresh_enabled:
+        scheduler.add_job(
+            daily_refresh, "cron", hour=3, minute=0, timezone="America/New_York",
+            id="daily_refresh", coalesce=True, max_instances=1,
+        )
+
+    # Legacy DOB BIS permits are too slow to query per scan; scans read this citywide list.
+    scheduler.add_job(
+        city_data.refresh_bis_snapshot, "interval", hours=city_data.BIS_SNAPSHOT_REFRESH_HOURS,
+        id="bis_permits", coalesce=True, max_instances=1, next_run_time=datetime.now(timezone.utc),
+    )
 
     # Optional: periodic ADS-B samples into public.adsb_samples (see backend/sql/adsb_samples.sql)
     if _env_flag("ADSB_INGEST_ENABLED"):
@@ -71,7 +100,10 @@ async def lifespan(app: FastAPI):
         )
 
     scheduler.start()
-    logger.info("Daily refresh scheduler started — runs every day at 3:00 AM.")
+    if daily_refresh_enabled:
+        logger.info("Daily refresh scheduled — every day at 3:00 AM New York time.")
+    else:
+        logger.info("Daily refresh disabled (DAILY_REFRESH_ENABLED=false).")
     yield
     scheduler.shutdown()
 
@@ -101,7 +133,13 @@ app.include_router(pdf.router)
 @app.exception_handler(ResponseValidationError)
 async def _response_validation_handler(request: Request, exc: ResponseValidationError) -> JSONResponse:
     """Return JSON (not plain text) when response_model validation fails — easier to debug clients."""
-    logger.exception("Response validation failed for %s", request.url.path)
+    # Each error's "input" can be the whole response, address included; log only where and why.
+    problems = [
+        f"{'.'.join(map(str, err.get('loc', ())))} ({err.get('type')})"
+        for err in exc.errors()
+        if isinstance(err, dict)
+    ]
+    logger.error("Response validation failed for %s: %s", request.url.path, "; ".join(problems))
     return JSONResponse(
         status_code=500,
         content={"detail": "Response validation failed"},

@@ -16,6 +16,8 @@ export interface LogisticsCard {
   rating?: number | null;
   review_count?: number | null;
   url?: string | null;
+  /** Provider behind rating / review_count on dining cards */
+  source?: RestaurantBarCard["source"];
 }
 
 export interface RestaurantBarCard {
@@ -32,6 +34,17 @@ export interface RestaurantBarCard {
   ranking_score?: number | null;
 }
 
+export type ThreatSeverityLevel =
+  | "quiet"
+  | "watch"
+  | "elevated"
+  /** Source didn't answer during the scan. */
+  | "unavailable"
+  /** ZerMap doesn't load this data yet (e.g. HPD violations). */
+  | "not_checked"
+  /** General guidance, not measured for this address. */
+  | "tip";
+
 export interface ThreatCard {
   id: string;
   emoji: string;
@@ -40,7 +53,9 @@ export interface ThreatCard {
   border_color: string;
   text_color: string;
   bullets: string[];
-  severity_level?: "quiet" | "watch" | "elevated";
+  severity_level?: ThreatSeverityLevel;
+  /** Share (0–100) of sampled NYC apartment locations with a lower count. */
+  nyc_percentile?: number | null;
 }
 
 export interface Zone {
@@ -49,6 +64,8 @@ export interface Zone {
   radius_meters: number;
   color: string;
   label: string;
+  /** Source and date, e.g. "NYPD complaint · Jun 12, 2026". */
+  detail?: string | null;
 }
 
 export interface SwarmPin {
@@ -68,6 +85,8 @@ export interface SwarmPin {
     | "construction"
     | "report";
   label: string;
+  /** Source and date, e.g. "311 request · Sep 30, 2026". */
+  detail?: string | null;
 }
 
 export interface FlightPath {
@@ -110,11 +129,28 @@ export interface MapData {
   swarm: SwarmPin[];
   /** Total unique real geocodes in the scan radius (may exceed swarm.length). */
   swarm_location_total?: number | null;
+  /** True when only the newest records were loaded, so swarm_location_total is a lower bound. */
+  swarm_total_is_lower_bound?: boolean;
   /** Scan radius in miles (municipal data + flight path filter). */
   scan_radius_miles?: number | null;
   flight_paths?: FlightPath[];
   /** Back-compat: some responses include a single path */
   flight_path?: FlightPath | null;
+}
+
+export interface DataSource {
+  key: string;
+  label: string;
+  status: "ok" | "unavailable";
+  count?: number | null;
+  /** ISO dates (YYYY-MM-DD) of the records counted. */
+  window_start?: string | null;
+  window_end?: string | null;
+  /** Newest record the source had published at scan time. */
+  as_of?: string | null;
+  provider?: string | null;
+  note?: string | null;
+  url?: string | null;
 }
 
 export interface ScanResult {
@@ -127,6 +163,11 @@ export interface ScanResult {
   risk_description: string;
   /** Primary wellness banner factor — maps to a threat card breakdown link. */
   banner_driver?: string | null;
+  /** False when too few sources answered to compute a Wellness Score. */
+  score_available?: boolean;
+  data_sources?: DataSource[];
+  /** Day (YYYY-MM-DD) the NYC comparison counts were measured. */
+  nyc_comparison_as_of?: string | null;
   logistics: LogisticsCard[];
   dining?: RestaurantBarCard[];
   threat_cards: ThreatCard[];

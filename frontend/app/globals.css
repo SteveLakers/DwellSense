@@ -6,17 +6,154 @@
 @import "mapbox-gl/dist/mapbox-gl.css";
 
 /* ── Base ──────────────────────────────────────────────────────────────────── */
-body {
-  background-color: #0f172a;
-  color: #f8fafc;
-  overflow-x: hidden;
-  letter-spacing: -0.015em;
+@layer base {
+  :root {
+    color-scheme: light;
+    /* Print grain: tiled SVG noise, dark specks for the paper page and light specks for ink bands. */
+    --grain-paper: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='g' x='0' y='0' width='100%25' height='100%25' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.3 0 0 0 -0.135'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+    --grain-ink: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='g' x='0' y='0' width='100%25' height='100%25' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0.26 0 0 0 -0.12'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+  }
+  body {
+    @apply bg-canvas text-fg;
+    background-image: var(--grain-paper);
+    overflow-x: hidden;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+  p {
+    text-wrap: pretty;
+  }
+  ::selection {
+    background: #ffcc00;
+    color: #151515;
+  }
+  /* Black ring with a yellow gap reads on light pages; dark bands switch to a plain yellow ring. */
+  :focus-visible {
+    outline: 3px solid #151515;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 2px #ffcc00;
+  }
+  .on-ink :focus-visible {
+    outline-color: #ffcc00;
+    box-shadow: none;
+  }
+  input::placeholder {
+    color: #63625b;
+    opacity: 1;
+  }
+}
+
+/* ── Type and building blocks ──────────────────────────────────────────────── */
+@layer components {
+  .wrap {
+    @apply mx-auto w-full max-w-[1240px] px-5 sm:px-8;
+  }
+
+  /* Condensed Archivo for headlines and figures; normal width everywhere else. */
+  .display {
+    font-weight: 800;
+    font-stretch: 72%;
+    line-height: 0.92;
+    letter-spacing: -0.01em;
+  }
+  .heading {
+    font-weight: 800;
+    font-stretch: 78%;
+    line-height: 1.02;
+  }
+  .figure {
+    font-weight: 800;
+    font-stretch: 74%;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  /* Poster headline: the narrowest, heaviest cut, for the homepage hero and other one-off moments. */
+  .display-xl {
+    font-weight: 900;
+    font-stretch: 66%;
+    line-height: 0.84;
+    letter-spacing: -0.012em;
+  }
+
+  /* Hover flips the sign: yellow goes ink, ink goes white, so the target is unmistakable. */
+  .btn {
+    @apply inline-flex min-h-[44px] items-center justify-center gap-2 rounded border-2 px-5 text-base font-semibold transition-[background-color,border-color,color,transform] duration-150 ease-out active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100;
+  }
+  .btn-primary {
+    @apply btn border-fg bg-brand text-fg hover:bg-fg hover:text-brand disabled:hover:bg-brand disabled:hover:text-fg;
+  }
+  .btn-outline {
+    @apply btn border-fg bg-transparent text-fg hover:bg-fg hover:text-white;
+  }
+  .btn-ink {
+    @apply btn border-fg bg-fg text-white hover:bg-white hover:text-fg disabled:hover:bg-fg disabled:hover:text-white;
+  }
+  /* For dark bands. */
+  .btn-brand-on-ink {
+    @apply btn border-brand bg-brand text-fg hover:border-white hover:bg-white disabled:hover:border-brand disabled:hover:bg-brand;
+  }
+  .btn-outline-on-ink {
+    @apply btn border-white/70 bg-transparent text-white hover:border-white hover:bg-white hover:text-fg;
+  }
+
+  .text-link {
+    @apply font-semibold text-fg underline decoration-brand decoration-[3px] underline-offset-[3px] transition-colors hover:bg-brand hover:decoration-fg;
+  }
+  .tag {
+    @apply inline-flex items-center gap-1.5 rounded border border-line bg-surface px-2 py-0.5 text-[13px] font-semibold text-fg-2;
+  }
+}
+
+@layer utilities {
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Diagonal hatch for "unavailable" swatches and the unscored ruler. */
+  .hatch {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      rgb(21 21 21 / 0.22) 0 2px,
+      transparent 2px 6px
+    );
+  }
+  /* Print grain on top of a band's own colour: light specks on ink, dark specks on yellow. */
+  .grain-ink {
+    background-image: var(--grain-ink);
+  }
+  .grain-paper {
+    background-image: var(--grain-paper);
+  }
+  /* Two rows of taxi checks (the Checker Cab stripe). */
+  .checker {
+    --check: 12px;
+    height: calc(var(--check) * 2);
+    background-color: #ffcc00;
+    background-image: conic-gradient(#151515 0 25%, transparent 0 50%, #151515 0 75%, transparent 0);
+    background-size: calc(var(--check) * 2) calc(var(--check) * 2);
+  }
+  /* Footer sign-off: "ZerMap" is 2.86em wide in .display-xl, so this spans the column and crops at the baseline. */
+  .footer-sign-box {
+    container-type: inline-size;
+  }
+  .footer-sign {
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: calc((100vw - 64px) / 2.9);
+    font-size: calc(100cqw / 2.87);
+    line-height: 0.8;
+    height: 0.76em;
+  }
 }
 
 /* ── Animations ────────────────────────────────────────────────────────────── */
 .fade-in {
   /* both: apply 0% keyframe before start; never leave opacity:0 if animation is disabled */
-  animation: fadeIn 0.8s ease-out both;
+  animation: fadeIn 0.24s ease-out both;
 }
 
 /* Opacity-only: a transformed ancestor breaks Mapbox Marker DOM positioning on hover. */
@@ -25,97 +162,193 @@ body {
   to   { opacity: 1; }
 }
 
-/* ── Horizontal Scroll Carousels ───────────────────────────────────────────── */
-.horizontal-scroll-container {
+/* The one deliberate motion moment on a report: the score rises and the ruler fills with its needle. */
+.ruler-fill {
+  transform-origin: left center;
+  animation: rulerFill 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) 0.25s both;
+}
+@keyframes rulerFill {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+/* Ends at the inline translateX that places the needle on the score. */
+.ruler-needle {
+  animation: rulerNeedle 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) 0.25s both;
+}
+@keyframes rulerNeedle {
+  from { transform: translateX(-100%); }
+}
+
+.progress-indeterminate {
+  animation: indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(260%); }
+}
+
+.pin-pulse {
+  animation: pinPulse 2s ease-out infinite;
+}
+@keyframes pinPulse {
+  0%   { transform: scale(1);   opacity: 0.55; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+
+/* Times Square zipper: two identical copies, so sliding by half loops without a seam. */
+.ticker-track {
   display: flex;
-  overflow-x: auto;
-  gap: 1rem;
-  padding-bottom: 1rem;
-  padding-top: 0.5rem;
-  scroll-snap-type: x mandatory;
-  -webkit-overflow-scrolling: touch;
-  cursor: grab;
+  width: max-content;
+  animation: ticker 70s linear infinite;
+}
+.ticker:hover .ticker-track,
+.ticker[data-paused="true"] .ticker-track {
+  animation-play-state: paused;
+}
+@keyframes ticker {
+  to { transform: translateX(-50%); }
 }
 
-.horizontal-scroll-container:active { cursor: grabbing; }
-.horizontal-scroll-container::-webkit-scrollbar { height: 8px; }
-.horizontal-scroll-container::-webkit-scrollbar-track {
-  background: #1e293b; border-radius: 8px; margin: 0 10px;
+/* SVG outlines draw themselves once; paths need pathLength="1". */
+.draw-in {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: drawIn 2.4s cubic-bezier(0.65, 0, 0.35, 1) 0.1s forwards;
 }
-.horizontal-scroll-container::-webkit-scrollbar-thumb {
-  background: #475569; border-radius: 8px; border: 2px solid #1e293b;
+@keyframes drawIn {
+  to { stroke-dashoffset: 0; }
 }
-.horizontal-scroll-container::-webkit-scrollbar-thumb:hover { background: #64748b; }
-
-/* Carousels with dot nav — hide the redundant horizontal scrollbar */
-.horizontal-scroll-container.hide-scrollbar {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-  padding-bottom: 0.5rem;
+.fill-in {
+  animation: fillIn 0.9s ease-out 1.2s both;
 }
-.horizontal-scroll-container.hide-scrollbar::-webkit-scrollbar {
-  display: none;
-  height: 0;
+@keyframes fillIn {
+  from { fill-opacity: 0; }
 }
-
-.stat-card {
-  min-width: 85vw;
-  scroll-snap-align: start;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  user-select: none;
+/* The map's circle lands once the outlines are mostly drawn; labels follow. */
+.pop-in {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: popIn 0.55s cubic-bezier(0.3, 1.5, 0.5, 1) 1.2s both;
+}
+@keyframes popIn {
+  from { opacity: 0; transform: scale(0.15); }
+}
+.fade-late {
+  animation: fadeIn 0.6s ease-out 1.6s both;
 }
 
-.logistics-card {
-  min-width: 80vw;
-  scroll-snap-align: start;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  user-select: none;
+/* Sonar ring around the homepage map's circle. Hidden at rest, so a skipped animation shows nothing. */
+.sonar {
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sonar 3.2s cubic-bezier(0.2, 0.6, 0.35, 1) 1.4s infinite;
+}
+.sonar-late {
+  animation-delay: 3s;
+}
+@keyframes sonar {
+  0%   { opacity: 0.95; transform: scale(1); }
+  100% { opacity: 0;    transform: scale(2.3); }
 }
 
-@media (min-width: 768px) {
-  .stat-card { min-width: 380px; }
-  .logistics-card { min-width: 320px; }
+/* Loading-screen radar: a sweep only, never blips, because nothing has been found yet. */
+.radar-sweep {
+  transform-box: view-box;
+  transform-origin: 50% 50%;
+  animation: radarSweep 3.6s linear infinite;
+}
+@keyframes radarSweep {
+  to { transform: rotate(360deg); }
 }
 
-/* ── Hover Cards ────────────────────────────────────────────────────────────── */
-.hover-card {
-  cursor: crosshair;
-  transition: all 0.2s ease;
-  border: 2px solid transparent;
+/* Text slides up out of an overflow-hidden mask; the real value is the only one ever shown.
+   Heavy Archivo descenders reach 0.21em below the baseline: pad masks around lowercase text by ~0.14em. */
+.rise {
+  display: inline-block;
+  animation: rise 0.9s cubic-bezier(0.2, 0.75, 0.2, 1) 0.1s both;
 }
-.hover-card:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+.rise-2 { animation-delay: 0.2s; }
+.rise-3 { animation-delay: 0.3s; }
+@keyframes rise {
+  from { transform: translateY(120%); }
 }
 
-/* ── Animated Plane ─────────────────────────────────────────────────────────── */
-.animated-plane {
-  font-size: 28px;
-  filter: drop-shadow(0 12px 8px rgba(0, 0, 0, 0.9));
-  transform: rotate(90deg) translate(-8px, -12px);
-  will-change: transform;
-  pointer-events: none;
+/* Blocks ease up over their first 220px in view (browsers without scroll timelines just show them).
+   Needs at least 220px of page below the block, or it never finishes.
+   Transform-based: never put it on the results map or any of its ancestors. */
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    .reveal {
+      animation: reveal linear both;
+      animation-timeline: view();
+      animation-range: entry 0% entry 220px;
+    }
+  }
+}
+@keyframes reveal {
+  from { opacity: 0; transform: translateY(36px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  /* A single fast run would park the bar off-screen; hold it still instead. */
+  .progress-indeterminate {
+    animation: none !important;
+  }
+  /* Hold still: the ticker shows its first items, the radar points north, outlines are drawn. */
+  .ticker-track,
+  .radar-sweep {
+    animation: none !important;
+  }
+  .draw-in {
+    animation: none !important;
+    stroke-dasharray: none;
+    stroke-dashoffset: 0;
+  }
 }
 
 /* ── Mapbox overrides ───────────────────────────────────────────────────────── */
-.mapboxgl-map { border-radius: 1rem; }
 .mapboxgl-popup-content {
-  background-color: #1e293b !important;
-  color: #f8fafc !important;
-  border: 1px solid #334155 !important;
-  border-radius: 8px !important;
+  background-color: #ffffff !important;
+  color: #151515 !important;
+  border: 2px solid #151515 !important;
+  border-radius: 6px !important;
+  box-shadow: 0 10px 24px -14px rgb(21 21 21 / 0.45) !important;
   font-family: inherit !important;
-  padding: 10px 14px !important;
+  padding: 10px 12px !important;
 }
-.mapboxgl-popup-tip { border-top-color: #334155 !important; border-bottom-color: #334155 !important; }
-.mapboxgl-ctrl-group { background: #1e293b !important; border: 1px solid #334155 !important; }
-.mapboxgl-ctrl-group button { background-color: #1e293b !important; color: #f8fafc !important; }
-.mapboxgl-ctrl-group button:hover { background-color: #334155 !important; }
-.mapboxgl-ctrl-group button .mapboxgl-ctrl-icon { filter: invert(1); }
-.mapboxgl-ctrl-attrib { background: rgba(15, 23, 42, 0.8) !important; }
-.mapboxgl-ctrl-attrib a { color: #64748b !important; }
+.mapboxgl-popup-anchor-bottom .mapboxgl-popup-tip,
+.mapboxgl-popup-anchor-bottom-left .mapboxgl-popup-tip,
+.mapboxgl-popup-anchor-bottom-right .mapboxgl-popup-tip { border-top-color: #151515 !important; }
+.mapboxgl-popup-anchor-top .mapboxgl-popup-tip,
+.mapboxgl-popup-anchor-top-left .mapboxgl-popup-tip,
+.mapboxgl-popup-anchor-top-right .mapboxgl-popup-tip { border-bottom-color: #151515 !important; }
+.mapboxgl-popup-anchor-left .mapboxgl-popup-tip { border-right-color: #151515 !important; }
+.mapboxgl-popup-anchor-right .mapboxgl-popup-tip { border-left-color: #151515 !important; }
+.mapboxgl-popup-close-button {
+  font-size: 18px;
+  width: 28px;
+  height: 28px;
+  color: #45453f;
+}
+.mapboxgl-popup-close-button:hover { background: #f2f2ee; color: #151515; }
+.mapboxgl-ctrl-group {
+  background: #ffffff !important;
+  border: 2px solid #151515 !important;
+  border-radius: 4px !important;
+  overflow: hidden;
+  box-shadow: none !important;
+}
+.mapboxgl-ctrl-group button { background-color: #ffffff !important; }
+.mapboxgl-ctrl-group button + button { border-top: 1px solid #d5d4cd !important; }
+.mapboxgl-ctrl-group button:hover { background-color: #f2f2ee !important; }
+.mapboxgl-ctrl-attrib { background: rgb(255 255 255 / 0.85) !important; }
+.mapboxgl-ctrl-attrib a { color: #45453f !important; }

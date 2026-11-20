@@ -1,6 +1,6 @@
 """
-Google Gemini AI — writes threat-card bullets only. Card chrome (emoji, colors,
-titles) and danger score come from Python (services.threat_card_layout).
+Google Gemini AI — writes one bottom-line sentence per data card. Card chrome,
+fact bullets and the Wellness Score come from Python (services.threat_card_layout).
 """
 
 import os
@@ -10,24 +10,27 @@ import time
 import asyncio
 import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 from models.schemas import Coordinate, FlightPath, FlightExposure, LogisticsCard
-from services import city_data
+from services import city_data, nyc_baselines
 from services.threat_card_layout import (
     CardChromeContext,
+    ScanCounts,
+    card_percentile,
+    card_severity,
     cards_from_specs_and_bullets,
     compute_risk_from_counts,
     filter_threat_cards_for_exposure,
-    ordered_card_ids,
 )
 
 logger = logging.getLogger(__name__)
 
 # Bump this when bullet formatting / merge rules change so in-memory caches don't
 # serve stale card text across deploys.
-_ANALYSIS_CACHE_VERSION = "2026-07-03-threat-quiet-emerald-v1"
+_ANALYSIS_CACHE_VERSION = "2026-11-20-construction-311-window-v6"
 
 _PENDING_BULLETS_TTL_SEC = 300
 
@@ -142,31 +145,75 @@ def _classify_gemini_error(e: Exception) -> tuple[str, str]:
 
     return "unknown", detail
 
-# Simple in-memory cache: address hash → analysis result
-_analysis_cache: dict[str, dict] = {}
+
+# ── Scan facts ────────────────────────────────────────────────────────────────
+
+_ANALYSIS_CACHE_MAX = 500
+_analysis_cache: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _cache_get(key: str) -> dict | None:
+    hit = _analysis_cache.get(key)
+    if hit is not None:
+        _analysis_cache.move_to_end(key)
+    return hit
+
+
+def _cache_put(key: str, value: dict) -> None:
+    _analysis_cache[key] = value
+    _analysis_cache.move_to_end(key)
+    while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
+        _analysis_cache.popitem(last=False)
+
+
+@dataclass(frozen=True)
+class ScanFacts:
+    crime: city_data.FeedResult
+    police_calls: city_data.FeedResult
+    reports_311: city_data.FeedResult
+    permits: city_data.FeedResult
+    evictions: city_data.FeedResult
+    counts: ScanCounts
+    radius_miles: float
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        crime: city_data.FeedResult,
+        police_calls: city_data.FeedResult,
+        reports_311: city_data.FeedResult,
+        permits: city_data.FeedResult,
+        evictions: city_data.FeedResult,
+    ) -> "ScanFacts":
+        return cls(
+            crime=crime,
+            police_calls=police_calls,
+            reports_311=reports_311,
+            permits=permits,
+            evictions=evictions,
+            counts=ScanCounts.from_feeds(
+                crime=crime,
+                police_calls=police_calls,
+                reports_311=reports_311,
+                permits=permits,
+                evictions=evictions,
+            ),
+            radius_miles=city_data.get_scan_radius_miles(),
+        )
 
 
 @dataclass
 class PendingBulletsContext:
     address: str
     coord: Coordinate
-    crime: list[dict]
-    reports_311: list[dict]
-    permits: list[dict]
-    evictions: list[dict]
+    facts: ScanFacts
     logistics: list[LogisticsCard]
     flight_path: FlightPath | None
     flight_exposure: FlightExposure | None
-    crime_count: int
-    reports_count: int
-    permit_count: int
-    eviction_count: int
-    noise_count: int
-    construction_311_count: int
     chrome_ctx: CardChromeContext
-    template_fb: dict[str, list[str]]
+    template_bullets: dict[str, list[str]]
     risk: dict
-    scan_radius_miles: float
     cache_key: str
 
 
@@ -213,113 +260,37 @@ def _gemini_meta(
         "gemini_error_detail": error_detail,
     }
 
-BULLETS_SYSTEM_PROMPT = """You are ZerMap, a renter-focused real estate forensics assistant.
-You receive a data brief about one NYC address. Write ONLY the nine threat-card bullet lists.
+
+# Cards that may get a fourth bullet from Gemini (only when the card's data loaded).
+GEMINI_CARD_IDS = ("high_churn", "police_calls", "area_safety", "demolitions", "noise_schedule", "reports_311")
+
+BULLETS_SYSTEM_PROMPT = """You are ZerMap, a renter-focused assistant for NYC apartment hunters.
+You receive a data brief about one NYC address. For each card listed below, write ONE
+practical step a renter can take because of this signal: something to check, to ask the
+landlord or broker, or to try during a visit (e.g. "Visit on a weeknight evening to hear the block.").
 
 Rules:
-- Write in plain English a renter can understand.
-- Each bullet must be short (max ~80 characters). One sentence.
-- Use the exact numbers in the brief when possible. Never invent stats.
-- high_churn = eviction filings only. Never mention construction permits there.
-- demolitions = DOB active permits plus 311 construction complaints (separate counts in brief).
-- noise_schedule = 311 noise complaints only (SR311_NOISE_30D), not all 311.
-- tenant_warnings = we do not have HPD violation data; do not claim violations at this address.
-- oven_effect = general orientation guidance only; not from NYC Open Data.
-- flight_path = only when FLIGHT line says a path exists inside the scan radius.
-- If the brief indicates there are zero recent items for a card, the 3rd bullet should be a short card-specific line (not a generic exclamation).
-- No markdown. No HTML. No nested JSON inside strings.
+- Plain English, one sentence, at most ~90 characters, starting with a verb.
+- Advice only. Don't restate the data or say whether anything is more, fewer, higher or
+  lower: the card already shows the counts and the NYC comparison. No digits.
+- nyc_level tells you how notable each signal is; for "lower than most of NYC" signals,
+  suggest a light check rather than a warning.
+- Never invent facts that aren't in the brief.
+- high_churn = residential evictions carried out by NYC Marshals (not court filings).
+- police_calls = crime-in-progress 911 calls dispatched to NYPD (not complaints).
+- area_safety = NYPD crime complaints; major felonies are the seven index crimes.
+- demolitions = active DOB permits for disruptive work plus 311 construction complaints.
+- noise_schedule = 311 noise complaints only.
+- reports_311 = all 311 requests except parking and vehicle complaints.
+- Don't mention dates or how recent the data is (NYPD data lags by months), and never
+  say "this week", "lately" or "recently".
+- Skip any card listed under UNAVAILABLE (return an empty string for it).
+- No markdown, no HTML.
 
-Return ONLY valid JSON (no markdown fences, no extra text) in this exact shape:
-{
-  "bullets": {
-    "high_churn": ["<bullet 1>", "<bullet 2>", "<bullet 3>"],
-    "police_calls": ["...", "...", "..."],
-    "area_safety": ["...", "...", "..."],
-    "tenant_warnings": ["...", "...", "..."],
-    "demolitions": ["...", "...", "..."],
-    "noise_schedule": ["...", "...", "..."],
-    "flight_path": ["...", "...", "..."],
-    "reports_311": ["...", "...", "..."],
-    "oven_effect": ["...", "...", "..."]
-  }
-}
-
-You must include all nine keys exactly as shown. Each value must be an array of exactly three strings.
+Return ONLY valid JSON (no markdown fences) in exactly this shape:
+{"bottom_lines": {"high_churn": "...", "police_calls": "...", "area_safety": "...",
+"demolitions": "...", "noise_schedule": "...", "reports_311": "..."}}
 """
-
-
-def _summarize_crime(data: list[dict]) -> str:
-    if not data:
-        return "count=0"
-    types: dict[str, int] = {}
-    for row in data:
-        t = row.get("crime_type", "Unknown")
-        types[t] = types.get(t, 0) + 1
-    top = sorted(types.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_text = "; ".join([f"{t}:{c}" for t, c in top]) if top else ""
-    return f"count={len(data)}; top={top_text}"
-
-
-def _summarize_311(data: list[dict]) -> str:
-    if not data:
-        return "count=0"
-    types: dict[str, int] = {}
-    for row in data:
-        t = row.get("complaint_type", "Unknown")
-        types[t] = types.get(t, 0) + 1
-    top = sorted(types.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_text = "; ".join([f"{t}:{c}" for t, c in top]) if top else ""
-    return f"count={len(data)}; top={top_text}"
-
-
-def _summarize_permits(data: list[dict]) -> str:
-    if not data:
-        return "active_count=0"
-    active = [r for r in data if r.get("permit_status", "").lower() in ("issued", "active", "renewed")]
-    types: dict[str, int] = {}
-    for row in active:
-        t = row.get("permit_type", "Unknown")
-        types[t] = types.get(t, 0) + 1
-    top = sorted(types.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_text = "; ".join([f"{t}:{c}" for t, c in top]) if top else ""
-    return f"active_count={len(active)}; top={top_text}"
-
-
-def _count_active_permits(data: list[dict]) -> int:
-    if not data:
-        return 0
-    return sum(1 for r in data if (r.get("permit_status", "") or "").lower() in ("issued", "active", "renewed"))
-
-
-def _311_blob(row: dict) -> str:
-    ctype = str(row.get("complaint_type") or "")
-    desc = str(row.get("descriptor") or "")
-    return f"{ctype} {desc}".lower()
-
-
-def _count_311_noise(data: list[dict]) -> int:
-    if not data:
-        return 0
-    keys = ("noise", "loud", "music", "party")
-    return sum(1 for row in data if any(k in _311_blob(row) for k in keys))
-
-
-def _count_311_construction(data: list[dict]) -> int:
-    """311 building / construction complaints (distinct from DOB permits)."""
-    if not data:
-        return 0
-    keys = ("construction", "building", "scaffold", "demolition", "crane")
-    return sum(1 for row in data if any(k in _311_blob(row) for k in keys))
-
-
-def _summarize_logistics(logistics: list[LogisticsCard]) -> str:
-    if not logistics:
-        return "none"
-    # Keep it short: only the first few cards (already sorted by importance in places.py)
-    parts = []
-    for card in logistics[:4]:
-        parts.append(f"{card.category}:{card.distance_value}{card.distance_unit}")
-    return "; ".join(parts)
 
 
 def _extract_text_from_response(response) -> str:
@@ -365,453 +336,309 @@ def _parse_ai_json(raw: str) -> dict:
             return json.loads(m.group(0))
         except json.JSONDecodeError:
             pass
-    raise ValueError(f"Could not parse JSON from Gemini output (first 200 chars): {s[:200]!r}")
+    # The reply can repeat the address from the brief, and this message gets logged.
+    raise ValueError(f"Could not parse JSON from Gemini output ({len(s)} chars)")
 
 
-def _third_bullet_no_key() -> str:
-    return "Add GEMINI_API_KEY to your backend environment for AI-written threat cards."
+# ── Wording helpers ───────────────────────────────────────────────────────────
+
+def _plural(n: int, singular: str, plural: str | None = None) -> str:
+    return singular if n == 1 else (plural or f"{singular}s")
 
 
-def _third_bullet_ai_failed() -> str:
-    return "AI summary unavailable this scan; counts and map data above are still accurate."
+def _nice_type(name: str) -> str:
+    """'UNSANITARY CONDITION' -> 'Unsanitary Condition'; mixed-case names unchanged."""
+    s = " ".join(str(name or "").split())
+    return s.title() if s.isupper() else s
 
 
-def _no_recent_reports_text() -> str:
-    """Deprecated generic line — prefer _card_bottom_line in fact-lock."""
-    return "No recent reports!"
+def _top_phrase(top: list[tuple[str, int]], n: int = 2) -> str:
+    parts = [f"{_nice_type(name)} ({count:,})" for name, count in top[:n] if name]
+    if not parts:
+        return ""
+    return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
 
 
-def _card_bottom_line(
-    card_id: str,
-    *,
-    scan_radius_miles: float,
-    crime_count: int,
-    reports_count: int,
-    permit_count: int,
-    eviction_count: int,
-    noise_count: int,
-    construction_311_count: int,
-    flight_path: FlightPath | None,
-) -> str:
-    """Third bullet when a card has no signal in its primary dataset."""
-    r = scan_radius_miles
-    if card_id == "high_churn":
-        return f"No housing-court eviction filings within ~{r:g} miles."
-    if card_id == "police_calls":
-        return "NYPD complaint volume is low for the last 30 days here."
-    if card_id == "area_safety":
-        return "Official crime data shows no reports in the last 30 days here."
-    if card_id == "demolitions":
-        return "Construction activity looks quiet on DOB and 311 records here."
-    if card_id == "noise_schedule":
-        return f"No noise-specific 311 complaints within ~{r:g} miles."
-    if card_id == "flight_path":
-        return "Map paths appear only when ADS-B tracks enter the scan radius."
-    if card_id == "reports_311":
-        return f"No 311 service requests within ~{r:g} miles in the last 30 days."
-    if card_id == "tenant_warnings":
-        return "We do not claim violations without a real HPD feed."
-    if card_id == "oven_effect":
-        return "General rental tip — not sourced from NYC Open Data."
-    return "No matching city records for this card in the scan radius."
+_COMPARE_SUBJECT = {
+    "high_churn": ("Evictions", "are"),
+    "police_calls": ("Crime-in-progress calls", "are"),
+    "area_safety": ("Major felonies", "are"),
+    "demolitions": ("Construction activity", "is"),
+    "noise_schedule": ("Noise complaints", "are"),
+    "reports_311": ("Requests to 311", "are"),
+}
 
 
-def _apply_no_recent_reports_bottom_line(
-    bullets_by_id: dict[str, list[str]],
-    *,
-    crime_count: int,
-    reports_count: int,
-    permit_count: int,
-    eviction_count: int,
-    noise_count: int,
-    construction_311_count: int,
-    flight_path: FlightPath | None,
-    flight_exposure: FlightExposure | None,
-    scan_radius_miles: float,
-) -> dict[str, list[str]]:
-    """
-    The UI treats the 3rd bullet as the "bottom line".
-    If there is no recent data for a card, make that bottom line easy to read.
-    """
-    out = {k: v[:] for k, v in bullets_by_id.items()}
-
-    def _set(cid: str, has_data: bool) -> None:
-        if has_data:
-            return
-        row = out.get(cid) or ["", "", ""]
-        row = _normalize_three(row)
-        row[2] = _card_bottom_line(
-            cid,
-            scan_radius_miles=scan_radius_miles,
-            crime_count=crime_count,
-            reports_count=reports_count,
-            permit_count=permit_count,
-            eviction_count=eviction_count,
-            noise_count=noise_count,
-            construction_311_count=construction_311_count,
-            flight_path=flight_path,
-        )
-        out[cid] = row
-
-    _set("police_calls", crime_count > 0)
-    _set("area_safety", crime_count > 0)
-    _set("reports_311", reports_count > 0)
-    _set("noise_schedule", noise_count > 0)
-    _set("demolitions", permit_count > 0 or construction_311_count > 0)
-    _set("high_churn", eviction_count > 0)
-    _set("flight_path", bool(flight_exposure and flight_exposure.show_flight_feature))
-
-    return out
-
-def _normalize_three(row: list[str] | None) -> list[str]:
-    if not row:
-        return ["", "", ""]
-    b = [str(x).strip() if x is not None else "" for x in row[:3]]
-    while len(b) < 3:
-        b.append("")
-    return b
+def _compare_sentence(card_id: str, chrome: CardChromeContext) -> str:
+    p = card_percentile(card_id, chrome)
+    if p is None:
+        return ""
+    pct = int(round(p * 100))
+    subject, verb = _COMPARE_SUBJECT[card_id]
+    if pct >= 50:
+        return f"{subject} here {verb} higher than at {pct}% of NYC apartment locations."
+    return f"{subject} here {verb} lower than at {100 - pct}% of NYC apartment locations."
 
 
-def _fallback_bullets_by_id(
-    crime_count: int,
-    reports_count: int,
-    permit_count: int,
-    eviction_count: int,
-    bullet_extra: str,
-) -> dict[str, list[str]]:
-    """Template bullets when Gemini is off or a card fails validation."""
-    crime_bottom = _no_recent_reports_text() if crime_count == 0 else bullet_extra
-    reports_bottom = _no_recent_reports_text() if reports_count == 0 else bullet_extra
-    permits_bottom = _no_recent_reports_text() if permit_count == 0 else bullet_extra
-    evictions_bottom = _no_recent_reports_text() if eviction_count == 0 else bullet_extra
-    return {
-        "high_churn": [
-            f"{eviction_count} eviction filing(s) in scan radius." if eviction_count else "No eviction filings in scan radius.",
-            "Turnover risk is based on housing-court records only.",
-            evictions_bottom,
-        ],
-        "police_calls": [
-            f"{crime_count} NYPD complaint(s) in the last 30 days.",
-            "See crime pins on the threat map.",
-            crime_bottom,
-        ],
-        "area_safety": [
-            f"{crime_count} crime report(s) within the scan radius." if crime_count else "No NYPD crime reports in the scan radius.",
-            "Safety view uses the same NYPD Open Data feed as the map.",
-            crime_bottom,
-        ],
-        "tenant_warnings": [
-            "HPD housing-violation records are not loaded in this scan.",
-            "Check NYC HPD online for this building's violation history.",
-            bullet_extra,
-        ],
-        "demolitions": [
-            f"{permit_count} active DOB permit(s) in scan radius.",
-            "Map may also show 311 building/construction complaints separately.",
-            permits_bottom,
-        ],
-        "noise_schedule": [
-            "311 noise complaints in the scan radius.",
-            "Commercial loading and traffic can add off-hours noise.",
-            reports_bottom,
-        ],
-        "flight_path": [
-            "Flight path analysis uses ADS-B when available.",
-            "Only paths within the scan radius are drawn on the map.",
-            bullet_extra,
-        ],
-        "reports_311": [
-            f"{reports_count} 311 reports filed nearby.",
-            "Primary complaints visible on map.",
-            reports_bottom,
-        ],
-        "oven_effect": [
-            "Unit orientation affects afternoon heat and AC costs.",
-            "Ask which way windows face before signing a lease.",
-            "General rental tip — not sourced from NYC Open Data.",
-        ],
-    }
-
-
-def _merge_bullets_with_fallback(
-    template: dict[str, list[str]],
-    gemini: dict[str, list[str]],
-) -> dict[str, list[str]]:
-    """Prefer Gemini strings; fall back per card if a row is empty or too thin."""
-    out: dict[str, list[str]] = {}
-    for cid in ordered_card_ids():
-        g = _normalize_three(gemini.get(cid) if isinstance(gemini.get(cid), list) else None)
-        nonempty = sum(1 for x in g if x.strip())
-        if nonempty >= 2:
-            out[cid] = g
-        else:
-            out[cid] = template[cid][:]
-    return out
-
-
-def _enforce_fact_locked_bullets(
-    bullets_by_id: dict[str, list[str]],
-    *,
-    crime_count: int,
-    reports_count: int,
-    permit_count: int,
-    eviction_count: int,
-    noise_count: int,
-    construction_311_count: int,
-    flight_path: FlightPath | None,
-    flight_exposure: FlightExposure | None,
-    scan_radius_miles: float,
-) -> dict[str, list[str]]:
-    """
-    Reliability guardrail: every card must match municipal / flight data we actually load.
-    Gemini prose is overwritten when it could contradict counts or cite unavailable datasets.
-    """
-    out = {k: _normalize_three(v) for k, v in (bullets_by_id or {}).items()}
-    r = scan_radius_miles
-
-    def _bottom(card_id: str) -> str:
-        return _card_bottom_line(
-            card_id,
-            scan_radius_miles=r,
-            crime_count=crime_count,
-            reports_count=reports_count,
-            permit_count=permit_count,
-            eviction_count=eviction_count,
-            noise_count=noise_count,
-            construction_311_count=construction_311_count,
-            flight_path=flight_path,
-        )
-
-    # 1. TENANT CHURN — evictions only (never permits / construction).
-    if eviction_count <= 0:
-        out["high_churn"] = [
-            f"No eviction filings found within ~{r:g} miles.",
-            "Lower turnover risk on housing-court records in this radius.",
-            _bottom("high_churn"),
-        ]
-    else:
-        out["high_churn"] = [
-            f"{eviction_count} eviction filing(s) within ~{r:g} miles.",
-            "Higher turnover can signal landlord or tenancy instability.",
-            out.get("high_churn", ["", "", ""])[2] or "",
-        ]
-
-    # 2. POLICE CALLS — NYPD crime complaints.
-    if crime_count <= 0:
-        out["police_calls"] = [
-            f"No NYPD complaints in the last 30 days within ~{r:g} miles.",
-            "Dispatch call volume looks low on NYPD Open Data for this radius.",
-            _bottom("police_calls"),
-        ]
-    else:
-        out["police_calls"] = [
-            f"{crime_count} NYPD complaint(s) in the last 30 days (~{r:g} mi).",
-            "See matching pins on the threat map.",
-            out.get("police_calls", ["", "", ""])[2] or "",
-        ]
-
-    # 3. AREA SAFETY — same crime feed, safety framing.
-    if crime_count <= 0:
-        out["area_safety"] = [
-            f"No NYPD crime reports within ~{r:g} miles in the last 30 days.",
-            "Violent and property crime signals look quiet on official data here.",
-            _bottom("area_safety"),
-        ]
-    else:
-        out["area_safety"] = [
-            f"{crime_count} crime report(s) within ~{r:g} miles.",
-            "Review crime pins and zone halos on the map.",
-            out.get("area_safety", ["", "", ""])[2] or "",
-        ]
-
-    # 4. TENANT WARNINGS — HPD violations are not ingested yet.
-    out["tenant_warnings"] = [
-        "HPD housing-violation data is not included in this scan yet.",
-        "Look up this building on the NYC HPD portal before signing.",
-        "We do not claim violations without a real HPD feed.",
+def _unavailable(label: str, *, scored: bool) -> list[str]:
+    return [
+        f"{label} are unavailable right now.",
+        "NYC Open Data didn't respond, so we're not guessing.",
+        "Left out of the Wellness Score this time." if scored else "Try the scan again in a few minutes.",
     ]
 
-    # 5. DEMOLITIONS — DOB active permits + 311 construction complaints.
-    parts: list[str] = []
-    if permit_count > 0:
-        parts.append(f"{permit_count} active DOB permit(s)")
-    if construction_311_count > 0:
-        parts.append(f"{construction_311_count} 311 building/construction report(s)")
-    if parts:
-        summary = " and ".join(parts) + f" within ~{r:g} miles."
-        out["demolitions"] = [
-            summary,
-            "Construction pins on the map may be DOB permits or 311 complaints.",
-            out.get("demolitions", ["", "", ""])[2] or "",
-        ]
+
+def _window_text(f: city_data.FeedResult) -> str:
+    return city_data.format_window(f.window_start, f.window_end)
+
+
+def build_template_bullets(
+    facts: ScanFacts,
+    chrome: CardChromeContext,
+    *,
+    flight_exposure: FlightExposure | None,
+    flight_path: FlightPath | None,
+) -> dict[str, list[str]]:
+    """Every bullet from exact counts; Gemini may append a fourth takeaway (see _apply_bottom_lines)."""
+    r = f"{facts.radius_miles:g} mi"
+    out: dict[str, list[str]] = {}
+
+    ev = facts.evictions
+    if not ev.available:
+        out["high_churn"] = _unavailable("Eviction records", scored=True)
     else:
-        out["demolitions"] = [
-            f"No active DOB permits or 311 construction complaints within ~{r:g} miles.",
-            "Nearby construction risk looks lower on city records right now.",
-            _bottom("demolitions"),
+        n = ev.count()
+        out["high_churn"] = [
+            f"{n:,} residential {_plural(n, 'eviction')} within {r} ({_window_text(ev)})."
+            if n else f"No residential evictions within {r} ({_window_text(ev)}).",
+            "Counts evictions carried out by NYC Marshals, not court filings.",
+            _compare_sentence("high_churn", chrome),
         ]
 
-    # 6. NOISE SCHEDULE — noise-specific 311 only (not all 311).
-    if noise_count <= 0:
-        out["noise_schedule"] = [
-            f"No 311 noise complaints within ~{r:g} miles in the last 30 days.",
-            "Off-hours noise may still come from traffic or businesses.",
-            _bottom("noise_schedule"),
-        ]
+    calls = facts.police_calls
+    if not calls.available:
+        out["police_calls"] = _unavailable("NYPD call records", scored=False)
     else:
-        out["noise_schedule"] = [
-            f"{noise_count} 311 noise complaint(s) within ~{r:g} miles.",
-            "Check map noise pins and commercial blocks nearby.",
-            out.get("noise_schedule", ["", "", ""])[2] or "",
+        n = calls.count()
+        critical = calls.part("critical")
+        out["police_calls"] = [
+            f"{n:,} crime-in-progress {_plural(n, 'call')} to NYPD within {r} ({_window_text(calls)})."
+            if n else f"No crime-in-progress calls to NYPD within {r} ({_window_text(calls)}).",
+            f"{critical:,} {'was' if critical == 1 else 'were'} critical, like shots fired or a burglary in progress."
+            if n else "That window ends at the newest data NYPD has published.",
+            _compare_sentence("police_calls", chrome),
         ]
 
-    # 7. FLIGHT NOISE — only when address-relative exposure is above NYC baselines.
+    crime = facts.crime
+    if not crime.available:
+        out["area_safety"] = _unavailable("NYPD complaint records", scored=True)
+    else:
+        n = crime.count()
+        major = crime.part("major_felonies")
+        out["area_safety"] = [
+            f"{n:,} NYPD crime {_plural(n, 'complaint')} within {r} ({_window_text(crime)})."
+            if n else f"No NYPD crime complaints within {r} ({_window_text(crime)}).",
+            f"{major:,} major {_plural(major, 'felony', 'felonies')}: "
+            f"{crime.part('violent'):,} violent, {crime.part('property'):,} property."
+            if n else "That window ends at the newest data NYPD has published.",
+            _compare_sentence("area_safety", chrome),
+        ]
+
+    out["tenant_warnings"] = [
+        "HPD Online lists each building's open violations and complaints.",
+        "Look up this building there before you sign.",
+        "Ask the landlord about open violations, heat and pests.",
+    ]
+
+    permits, r311 = facts.permits, facts.reports_311
+    if not permits.available and not r311.available:
+        out["demolitions"] = _unavailable("DOB permit and 311 records", scored=True)
+    else:
+        construction = r311.part("construction")
+        c311 = (
+            f"311 also logged {construction:,} construction {_plural(construction, 'complaint')} "
+            f"({_window_text(r311)})."
+            if r311.available else "311 construction complaints are unavailable right now."
+        )
+        if permits.available:
+            n = permits.count()
+            demo = permits.part("demolition")
+            b1 = (
+                f"{n:,} active DOB {_plural(n, 'permit')} for disruptive work within {r} "
+                f"(issued {_window_text(permits)})."
+                if n else f"No active DOB permits for disruptive work within {r} (issued {_window_text(permits)})."
+            )
+            b2 = f"Includes {demo:,} full {_plural(demo, 'demolition')}. {c311}" if n else c311
+        else:
+            b1 = "DOB permit records are unavailable right now."
+            b2 = c311
+        out["demolitions"] = [b1, b2, _compare_sentence("demolitions", chrome)]
+
+    if not r311.available:
+        out["noise_schedule"] = _unavailable("311 records", scored=True)
+        out["reports_311"] = _unavailable("311 records", scored=True)
+    else:
+        noise = r311.part("noise")
+        noise_top = _top_phrase(r311.extra.get("noise_top", []))
+        out["noise_schedule"] = [
+            f"{noise:,} noise {_plural(noise, 'complaint')} to 311 within {r} ({_window_text(r311)})."
+            if noise else f"No noise complaints to 311 within {r} ({_window_text(r311)}).",
+            f"Most often: {noise_top}." if noise and noise_top else "Covers residential, street and business noise reports.",
+            _compare_sentence("noise_schedule", chrome),
+        ]
+        n = r311.count()
+        top = _top_phrase(r311.top_types)
+        out["reports_311"] = [
+            f"{n:,} {_plural(n, 'request')} to 311 within {r} ({_window_text(r311)})."
+            if n else f"No requests to 311 within {r} ({_window_text(r311)}).",
+            f"Most common: {top}." if n and top else "Parking and vehicle complaints are excluded.",
+            _compare_sentence("reports_311", chrome),
+        ]
+
     if not flight_exposure or not flight_exposure.show_flight_feature:
         out["flight_path"] = ["", "", ""]
-    elif flight_exposure.headline:
-        third = (
-            "See the cyan route on the map for a recent plane path."
+    else:
+        out["flight_path"] = [
+            flight_exposure.headline or "More low-altitude flights than most NYC apartment locations.",
+            flight_exposure.detail or "Based on stored ADS-B aircraft positions.",
+            "Cyan lines on the map are recent real flight tracks."
             if flight_path is not None
-            else "Map routes appear when recent flight paths cross this area."
-        )
-        out["flight_path"] = [
-            flight_exposure.headline,
-            flight_exposure.detail or "Based on stored ADS-B samples for NYC.",
-            third,
-        ]
-    elif flight_path is None:
-        out["flight_path"] = [
-            f"Elevated aircraft exposure within ~{r:g} miles.",
-            "Flight noise is above typical NYC levels for this radius.",
-            _bottom("flight_path"),
-        ]
-    else:
-        label = (flight_path.label or "Recent flight track").strip()
-        if len(label) > 72:
-            label = label[:69] + "..."
-        closest = flight_path.closest_miles
-        closest_txt = f" (closest {closest:.1f} mi)" if closest is not None else ""
-        out["flight_path"] = [
-            f"Elevated flight exposure within ~{r:g} mi{closest_txt}: {label}",
-            "Cyan lines on the map are real ADS-B tracks within the scan radius.",
-            out.get("flight_path", ["", "", ""])[2] or "",
+            else "No recent tracks crossed the map area during the latest sample.",
         ]
 
-    # 8. 311 REPORTS — all 311 in radius.
-    if reports_count <= 0:
-        out["reports_311"] = [
-            f"No 311 service requests within ~{r:g} miles in the last 30 days.",
-            "Neighbor complaint volume looks low on NYC Open Data.",
-            _bottom("reports_311"),
-        ]
-    else:
-        out["reports_311"] = [
-            f"{reports_count} 311 report(s) within ~{r:g} miles.",
-            "Hover swarm pins on the map for complaint types.",
-            out.get("reports_311", ["", "", ""])[2] or "",
-        ]
-
-    # 9. OVEN EFFECT — general guidance only (no municipal sun-exposure feed).
     out["oven_effect"] = [
         "Afternoon heat depends on which way the unit faces.",
         "West- and south-facing windows can raise summer AC costs.",
-        "General rental tip — not sourced from NYC Open Data.",
+        "Ask which way the windows face, or visit on a sunny afternoon.",
     ]
-
     return out
 
 
-def _finalize_threat_bullets(
-    bullets_by_id: dict[str, list[str]],
+# ── Gemini bottom lines ───────────────────────────────────────────────────────
+
+_COMPARISON_RE = re.compile(
+    r"\b(nyc|new york|percent|percentile|average|typical|than|citywide|more|fewer|less|higher|lower"
+    r"|quieter|louder|safer|busier|calmer|worse|better)\b|%",
+    re.IGNORECASE,
+)
+_RECENCY_RE = re.compile(r"\b(data|latest|recent|recently|lately|this week|this month)\b", re.IGNORECASE)
+
+
+def _accept_bottom_line(text: object) -> str | None:
+    """Gemini text is used only if it is short and plain advice: no numbers, NYC comparisons
+    or claims about how recent the data is.
+
+    Counts, date ranges and the NYC comparison come from code; a model restating them can get them wrong.
+    """
+    if not isinstance(text, str):
+        return None
+    s = " ".join(text.split()).strip()
+    if not s or len(s) > 120 or "<" in s or ">" in s:
+        return None
+    if any(ch.isdigit() for ch in s) or _COMPARISON_RE.search(s) or _RECENCY_RE.search(s):
+        return None
+    return s
+
+
+def _feed_line(name: str, f: city_data.FeedResult, fields: dict[str, object]) -> str:
+    if not f.available:
+        return f"{name}: UNAVAILABLE"
+    window = city_data.format_window(f.window_start, f.window_end)
+    body = "; ".join(f"{k}={v}" for k, v in fields.items() if v not in (None, ""))
+    return f"{name} [{window}]: {body}"
+
+
+_NYC_LEVEL_WORDS = {
+    "quiet": "lower than most NYC apartment locations",
+    "watch": "about typical for NYC",
+    "elevated": "higher than most NYC apartment locations",
+}
+
+
+def _pct_field(card_id: str, chrome: CardChromeContext) -> str | None:
+    return _NYC_LEVEL_WORDS.get(card_severity(card_id, chrome))
+
+
+def build_gemini_brief(ctx: PendingBulletsContext) -> str:
+    f, chrome = ctx.facts, ctx.chrome_ctx
+
+    def top(fr: city_data.FeedResult) -> str:
+        return ", ".join(f"{_nice_type(k)}:{v}" for k, v in fr.top_types[:3])
+
+    unavailable = [
+        card for card, fr in (
+            ("high_churn", f.evictions), ("police_calls", f.police_calls), ("area_safety", f.crime),
+            ("noise_schedule", f.reports_311), ("reports_311", f.reports_311),
+        ) if not fr.available
+    ]
+    if not f.permits.available and not f.reports_311.available:
+        unavailable.append("demolitions")
+    fx = ctx.flight_exposure
+    if fx and fx.show_flight_feature:
+        flight_text = fx.headline or "Above typical NYC flight exposure."
+    elif fx is None or fx.elevation_level == "unavailable":
+        # Not compared (paused, unreadable or no baseline): never tell the model it is typical.
+        flight_text = "Not measured (no flight section in this report)."
+    else:
+        flight_text = "Typical for NYC (card hidden)."
+    lines = [
+        f"ADDRESS: {ctx.address}",
+        f"RADIUS_MILES: {f.radius_miles:g}",
+        _feed_line("NYPD_COMPLAINTS (newest NYPD release)", f.crime, {
+            "total": f.crime.count(), "major_felonies": f.crime.part("major_felonies"),
+            "violent": f.crime.part("violent"), "property": f.crime.part("property"),
+            "top": top(f.crime), "major_felonies_nyc_level": _pct_field("area_safety", chrome),
+        }),
+        _feed_line("NYPD_CRIME_IN_PROGRESS_CALLS (newest NYPD release)", f.police_calls, {
+            "total": f.police_calls.count(), "critical": f.police_calls.part("critical"),
+            "nyc_level": _pct_field("police_calls", chrome),
+        }),
+        _feed_line("SR311 (parking/vehicle excluded)", f.reports_311, {
+            "total": f.reports_311.count(), "noise": f.reports_311.part("noise"),
+            "construction": f.reports_311.part("construction"), "top": top(f.reports_311),
+            "nyc_level": _pct_field("reports_311", chrome),
+            "noise_nyc_level": _pct_field("noise_schedule", chrome),
+        }),
+        _feed_line("DOB_ACTIVE_PERMITS (issued in window, still open)", f.permits, {
+            "total": f.permits.count(), "full_demolitions": f.permits.part("demolition"),
+            "scaffolds_and_sheds": f.permits.part("scaffold_shed"),
+            "construction_nyc_level": _pct_field("demolitions", chrome),
+        }),
+        _feed_line("RESIDENTIAL_EVICTIONS (carried out by NYC Marshals)", f.evictions, {
+            "total": f.evictions.count(), "nyc_level": _pct_field("high_churn", chrome),
+        }),
+        f"FLIGHT: {flight_text}",
+        f"UNAVAILABLE: {', '.join(unavailable) if unavailable else 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+def _apply_bottom_lines(
+    template: dict[str, list[str]],
+    lines: dict[str, object],
     *,
-    crime_count: int,
-    reports_count: int,
-    permit_count: int,
-    eviction_count: int,
-    noise_count: int,
-    construction_311_count: int,
-    flight_path: FlightPath | None,
-    flight_exposure: FlightExposure | None,
-    scan_radius_miles: float,
+    chrome: CardChromeContext,
 ) -> dict[str, list[str]]:
-    stepped = _apply_no_recent_reports_bottom_line(
-        bullets_by_id,
-        crime_count=crime_count,
-        reports_count=reports_count,
-        permit_count=permit_count,
-        eviction_count=eviction_count,
-        noise_count=noise_count,
-        construction_311_count=construction_311_count,
-        flight_path=flight_path,
-        flight_exposure=flight_exposure,
-        scan_radius_miles=scan_radius_miles,
-    )
-    return _enforce_fact_locked_bullets(
-        stepped,
-        crime_count=crime_count,
-        reports_count=reports_count,
-        permit_count=permit_count,
-        eviction_count=eviction_count,
-        noise_count=noise_count,
-        construction_311_count=construction_311_count,
-        flight_path=flight_path,
-        flight_exposure=flight_exposure,
-        scan_radius_miles=scan_radius_miles,
-    )
-
-
-def _card_chrome_ctx(
-    *,
-    crime_count: int,
-    reports_count: int,
-    permit_count: int,
-    eviction_count: int,
-    noise_count: int,
-    construction_311_count: int,
-    flight_path: FlightPath | None,
-    show_flight_feature: bool,
-) -> CardChromeContext:
-    return CardChromeContext(
-        crime_count=crime_count,
-        reports_count=reports_count,
-        permit_count=permit_count,
-        eviction_count=eviction_count,
-        noise_count=noise_count,
-        construction_311_count=construction_311_count,
-        has_flight_path=bool(flight_path) and show_flight_feature,
-        show_flight_feature=show_flight_feature,
-    )
+    """Accepted takeaways are appended after the three fact bullets, which stay unchanged."""
+    out = {k: v[:] for k, v in template.items()}
+    for cid in GEMINI_CARD_IDS:
+        if card_severity(cid, chrome) not in ("quiet", "watch", "elevated"):
+            continue
+        accepted = _accept_bottom_line(lines.get(cid))
+        if accepted and cid in out:
+            out[cid].append(accepted)
+    return out
 
 
 async def _run_gemini_bullets(ctx: PendingBulletsContext) -> dict:
-    """Call Gemini for threat-card bullets; fall back to template bullets on failure."""
+    """Gemini writes one bottom line per data card; template bullets stay on any failure."""
+    def result(bullets: dict[str, list[str]], **meta) -> dict:
+        return {**ctx.risk, "threat_cards": _visible_threat_cards(bullets, ctx.chrome_ctx), **_gemini_meta(**meta)}
+
     raw_gemini_env = (os.getenv("GEMINI_API_KEY") or "").strip()
     gemini_api_key = _effective_gemini_key(raw_gemini_env)
     if not gemini_api_key:
-        fb = _fallback_bullets_by_id(
-            ctx.crime_count,
-            ctx.reports_count,
-            ctx.permit_count,
-            ctx.eviction_count,
-            _third_bullet_no_key(),
-        )
-        fb = _finalize_threat_bullets(
-            fb,
-            crime_count=ctx.crime_count,
-            reports_count=ctx.reports_count,
-            permit_count=ctx.permit_count,
-            eviction_count=ctx.eviction_count,
-            noise_count=ctx.noise_count,
-            construction_311_count=ctx.construction_311_count,
-            flight_path=ctx.flight_path,
-            flight_exposure=ctx.flight_exposure,
-            scan_radius_miles=ctx.scan_radius_miles,
-        )
-        return {
-            **ctx.risk,
-            "threat_cards": _visible_threat_cards(fb, ctx.chrome_ctx),
-            **_gemini_meta(configured=False, status="no_key" if not raw_gemini_env else "placeholder"),
-        }
+        return result(ctx.template_bullets, configured=False, status="no_key" if not raw_gemini_env else "placeholder")
 
     gemini_model_name = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
     genai.configure(api_key=gemini_api_key)
@@ -824,86 +651,35 @@ async def _run_gemini_bullets(ctx: PendingBulletsContext) -> dict:
             response_mime_type="application/json",
         ),
     )
+    brief = build_gemini_brief(ctx)
 
-    if ctx.flight_exposure and ctx.flight_exposure.show_flight_feature:
-        flight_text = ctx.flight_exposure.headline or "Elevated flight noise vs typical NYC blocks."
-    elif ctx.flight_path:
-        flight_text = f"Flight path: {ctx.flight_path.label}"
-    else:
-        flight_text = "Flight exposure typical for NYC (card omitted)."
-
-    prompt = (
-        "ADDRESS: " + ctx.address + "\n"
-        f"COORD: {ctx.coord.lat:.5f},{ctx.coord.lng:.5f}\n"
-        f"CRIME_30D_{ctx.scan_radius_miles:g}MI: {_summarize_crime(ctx.crime)}\n"
-        f"SR311_30D_{ctx.scan_radius_miles:g}MI: {_summarize_311(ctx.reports_311)}\n"
-        f"SR311_NOISE_30D: count={ctx.noise_count}\n"
-        f"SR311_CONSTRUCTION_30D: count={ctx.construction_311_count}\n"
-        f"PERMITS_90D_{ctx.scan_radius_miles:g}MI: {_summarize_permits(ctx.permits)}\n"
-        f"EVICTIONS_NEARBY: count={ctx.eviction_count}\n"
-        f"LOGISTICS: {_summarize_logistics(ctx.logistics)}\n"
-        f"FLIGHT: {flight_text}\n"
-        "\n"
-        "Return the 27 bullets JSON only. Use the numbers above; don't invent new stats."
-    )
-
-    async def _call_gemini_bullets() -> dict[str, list[str]]:
+    async def _call() -> dict[str, list[str]]:
         if _GEMINI_TIMEOUT > 0:
             response = await asyncio.wait_for(
-                asyncio.to_thread(model.generate_content, prompt),
+                asyncio.to_thread(model.generate_content, brief),
                 timeout=_GEMINI_TIMEOUT,
             )
         else:
-            response = await asyncio.to_thread(model.generate_content, prompt)
+            response = await asyncio.to_thread(model.generate_content, brief)
         raw = _extract_text_from_response(response)
         if not raw:
-            fb = getattr(response, "prompt_feedback", None)
-            logger.error("Gemini returned empty text. prompt_feedback=%s", fb)
+            logger.error("Gemini returned empty text. prompt_feedback=%s", getattr(response, "prompt_feedback", None))
             raise ValueError("Empty Gemini response (blocked or no candidates)")
         data = _parse_ai_json(raw)
-        inner = data.get("bullets") if isinstance(data, dict) else None
-        if not isinstance(inner, dict):
-            raise ValueError("Missing or invalid 'bullets' object in Gemini JSON")
-        gemini_map: dict[str, list[str]] = {}
-        for cid in ordered_card_ids():
-            row = inner.get(cid)
-            gemini_map[cid] = row if isinstance(row, list) else []
-        merged = _merge_bullets_with_fallback(ctx.template_fb, gemini_map)
-        return _finalize_threat_bullets(
-            merged,
-            crime_count=ctx.crime_count,
-            reports_count=ctx.reports_count,
-            permit_count=ctx.permit_count,
-            eviction_count=ctx.eviction_count,
-            noise_count=ctx.noise_count,
-            construction_311_count=ctx.construction_311_count,
-            flight_path=ctx.flight_path,
-            flight_exposure=ctx.flight_exposure,
-            scan_radius_miles=ctx.scan_radius_miles,
-        )
+        lines = data.get("bottom_lines") if isinstance(data, dict) else None
+        if not isinstance(lines, dict):
+            raise ValueError("Missing or invalid 'bottom_lines' object in Gemini JSON")
+        return _apply_bottom_lines(ctx.template_bullets, lines, chrome=ctx.chrome_ctx)
 
     for attempt in range(2):
         t0 = time.monotonic()
         try:
-            bullets_by_id = await _call_gemini_bullets()
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            return {
-                **ctx.risk,
-                "threat_cards": _visible_threat_cards(bullets_by_id, ctx.chrome_ctx),
-                **_gemini_meta(configured=True, status="ok", latency_ms=latency_ms),
-            }
+            bullets_by_id = await _call()
+            return result(bullets_by_id, configured=True, status="ok", latency_ms=int((time.monotonic() - t0) * 1000))
         except asyncio.TimeoutError:
             latency_ms = int((time.monotonic() - t0) * 1000)
-            logger.error(
-                "Gemini timed out after %.1fs (measured %.0fms) — using fallback bullets.",
-                _GEMINI_TIMEOUT,
-                latency_ms,
-            )
-            return {
-                **ctx.risk,
-                "threat_cards": _visible_threat_cards(ctx.template_fb, ctx.chrome_ctx),
-                **_gemini_meta(configured=True, status="timeout", latency_ms=latency_ms),
-            }
+            logger.error("Gemini timed out after %.1fs (measured %.0fms) — using template bullets.", _GEMINI_TIMEOUT, latency_ms)
+            return result(ctx.template_bullets, configured=True, status="timeout", latency_ms=latency_ms)
         except Exception as e:
             if attempt == 0:
                 logger.warning("Gemini attempt 1 failed (%s), retrying once…", e)
@@ -911,28 +687,12 @@ async def _run_gemini_bullets(ctx: PendingBulletsContext) -> dict:
                 continue
             latency_ms = int((time.monotonic() - t0) * 1000)
             error_kind, error_detail = _classify_gemini_error(e)
-            logger.exception(
-                "Gemini failed after retry (kind=%s, %.0fms) — using fallback bullets",
-                error_kind,
-                latency_ms,
+            logger.exception("Gemini failed after retry (kind=%s, %.0fms) — using template bullets", error_kind, latency_ms)
+            return result(
+                ctx.template_bullets, configured=True, status="error", latency_ms=latency_ms,
+                error_kind=error_kind, error_detail=error_detail or None,
             )
-            return {
-                **ctx.risk,
-                "threat_cards": _visible_threat_cards(ctx.template_fb, ctx.chrome_ctx),
-                **_gemini_meta(
-                    configured=True,
-                    status="error",
-                    latency_ms=latency_ms,
-                    error_kind=error_kind,
-                    error_detail=error_detail or None,
-                ),
-            }
-
-    return {
-        **ctx.risk,
-        "threat_cards": _visible_threat_cards(ctx.template_fb, ctx.chrome_ctx),
-        **_gemini_meta(configured=True, status="error"),
-    }
+    return result(ctx.template_bullets, configured=True, status="error")
 
 
 async def complete_deferred_bullets(bullets_token: str) -> dict | None:
@@ -941,10 +701,9 @@ async def complete_deferred_bullets(bullets_token: str) -> dict | None:
     if not token:
         return None
 
-    if token in _analysis_cache:
-        hit = _analysis_cache[token]
-        if hit.get("gemini_status") not in (None, "pending"):
-            return hit
+    hit = _cache_get(token)
+    if hit and hit.get("gemini_status") not in (None, "pending"):
+        return hit
 
     _purge_expired_pending()
     pending = _pending_bullets.get(token)
@@ -953,179 +712,111 @@ async def complete_deferred_bullets(bullets_token: str) -> dict | None:
     _, ctx = pending
 
     result = await _run_gemini_bullets(ctx)
-    _analysis_cache[ctx.cache_key] = result
+    _cache_put(ctx.cache_key, result)
     _pending_bullets.pop(token, None)
     return result
+
+
+def _cache_key(address: str, facts: ScanFacts, flight_exposure: FlightExposure | None, key_fp: str) -> str:
+    def feed_tag(fr: city_data.FeedResult) -> str:
+        if not fr.available:
+            return f"{fr.key}:u"
+        return f"{fr.key}:{fr.total}:{sorted(fr.breakdown.items())}:{fr.window_start}:{fr.window_end}"
+
+    fx = flight_exposure
+    fx_tag = f"fx{int(fx.show_flight_feature)}:{_flight_card_percentile(fx)}:{fx.headline}" if fx else "fx-"
+    payload = "|".join([
+        _ANALYSIS_CACHE_VERSION,
+        str(nyc_baselines.meta().get("generated_at", "")),
+        address,
+        *(feed_tag(fr) for fr in (facts.crime, facts.police_calls, facts.reports_311, facts.permits, facts.evictions)),
+        fx_tag,
+        key_fp,
+    ])
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def _flight_card_percentile(fx: FlightExposure | None) -> float | None:
+    """Highest of the night / day / combined NYC percentiles, like other cards' highest metric."""
+    if not fx:
+        return None
+    values = [p for p in (fx.night_percentile, fx.day_percentile, fx.combined_percentile) if p is not None]
+    return max(values) if values else None
 
 
 async def analyze(
     address: str,
     coord: Coordinate,
-    crime: list[dict],
-    reports_311: list[dict],
-    permits: list[dict],
-    evictions: list[dict],
+    facts: ScanFacts,
     logistics: list[LogisticsCard],
     flight_path: FlightPath | None,
     flight_exposure: FlightExposure | None,
     *,
-    crime_capped: bool = False,
-    reports_capped: bool = False,
-    permits_capped: bool = False,
-    evictions_capped: bool = False,
     defer_gemini: bool = False,
 ) -> dict:
     """
-    Python builds danger score + card chrome; Gemini writes bullets only.
-    Falls back to template bullets if Gemini is unavailable.
+    Python builds the Wellness Score, card chrome and fact bullets; Gemini only adds
+    one bottom line per data card. Template bullets are used whenever Gemini is off.
     """
-    crime_count = len(crime)
-    reports_count = len(reports_311)
-    permit_count = _count_active_permits(permits)
-    eviction_count = len(evictions)
-    noise_count = _count_311_noise(reports_311)
-    construction_311_count = _count_311_construction(reports_311)
-    scan_radius_miles = city_data.get_scan_radius_miles()
     show_flight = bool(flight_exposure and flight_exposure.show_flight_feature)
-    chrome_ctx = _card_chrome_ctx(
-        crime_count=crime_count,
-        reports_count=reports_count,
-        permit_count=permit_count,
-        eviction_count=eviction_count,
-        noise_count=noise_count,
-        construction_311_count=construction_311_count,
-        flight_path=flight_path if show_flight else None,
+    chrome_ctx = CardChromeContext(
+        counts=facts.counts,
+        flight_percentile=_flight_card_percentile(flight_exposure) if show_flight else None,
         show_flight_feature=show_flight,
     )
 
     raw_gemini_env = (os.getenv("GEMINI_API_KEY") or "").strip()
     gemini_api_key = _effective_gemini_key(raw_gemini_env)
+    if not gemini_api_key and raw_gemini_env:
+        logger.warning(
+            "GEMINI_API_KEY is set but looks like a placeholder or template; Gemini is disabled. "
+            "Use a real key from Google AI Studio on the backend (Railway), not the frontend."
+        )
 
-    # Determine pre-call status for no-key / placeholder cases
-    if not gemini_api_key:
-        if raw_gemini_env:
-            _pre_status = "placeholder"
-            logger.warning(
-                "GEMINI_API_KEY is set but looks like a placeholder or template; Gemini is disabled. "
-                "Use a real key from Google AI Studio on the backend (Railway), not the frontend."
-            )
-        else:
-            _pre_status = "no_key"
-    else:
-        _pre_status = None  # will be set after the Gemini call
-
-    key_fp = hashlib.md5(gemini_api_key.encode()).hexdigest()[:12] if gemini_api_key else "none"
-    fx = flight_exposure
-    fx_tag = (
-        f"fx{int(fx.show_flight_feature)}:{fx.combined_percentile or 0}:"
-        if fx
-        else "fx0:"
-    )
-    cache_key = hashlib.md5(
-        f"{_ANALYSIS_CACHE_VERSION}:{address}:{crime_count}:{reports_count}:{permit_count}:{eviction_count}:"
-        f"n{noise_count}c{construction_311_count}:{fx_tag}"
-        f"c{int(crime_capped)}r{int(reports_capped)}p{int(permits_capped)}e{int(evictions_capped)}:{key_fp}".encode()
-    ).hexdigest()
-    if cache_key in _analysis_cache:
-        hit = _analysis_cache[cache_key]
-        if "gemini_configured" not in hit:
-            hit = {**hit, "gemini_configured": bool(gemini_api_key)}
-        if "gemini_status" not in hit or "gemini_error_detail" not in hit:
-            hit = {
-                **hit,
-                "gemini_status": None,
-                "gemini_latency_ms": None,
-                "gemini_timeout_seconds": _GEMINI_TIMEOUT_REPORT,
-                "gemini_error_kind": None,
-                "gemini_error_detail": None,
-            }
+    key_fp = hashlib.sha256(gemini_api_key.encode()).hexdigest()[:12] if gemini_api_key else "none"
+    cache_key = _cache_key(address, facts, flight_exposure, key_fp)
+    hit = _cache_get(cache_key)
+    if hit is not None:
         return hit
 
-    risk = compute_risk_from_counts(
-        crime_count,
-        reports_count,
-        permit_count,
-        eviction_count,
-        noise_count,
-        crime_capped=crime_capped,
-        reports_capped=reports_capped,
-        permits_capped=permits_capped,
-        evictions_capped=evictions_capped,
+    risk = compute_risk_from_counts(facts.counts)
+    template = build_template_bullets(
+        facts,
+        chrome_ctx,
+        flight_exposure=flight_exposure,
+        flight_path=flight_path if show_flight else None,
     )
 
     if not gemini_api_key:
-        fb = _fallback_bullets_by_id(
-            crime_count, reports_count, permit_count, eviction_count, _third_bullet_no_key()
-        )
-        fb = _finalize_threat_bullets(
-            fb,
-            crime_count=crime_count,
-            reports_count=reports_count,
-            permit_count=permit_count,
-            eviction_count=eviction_count,
-            noise_count=noise_count,
-            construction_311_count=construction_311_count,
-            flight_path=flight_path if show_flight else None,
-            flight_exposure=flight_exposure,
-            scan_radius_miles=scan_radius_miles,
-        )
         result = {
             **risk,
-            "threat_cards": _visible_threat_cards(fb, chrome_ctx),
-            **_gemini_meta(configured=False, status=_pre_status),
+            "threat_cards": _visible_threat_cards(template, chrome_ctx),
+            **_gemini_meta(configured=False, status="placeholder" if raw_gemini_env else "no_key"),
         }
-        _analysis_cache[cache_key] = result
+        _cache_put(cache_key, result)
         return result
-
-    template_fb = _fallback_bullets_by_id(
-        crime_count, reports_count, permit_count, eviction_count, _third_bullet_ai_failed()
-    )
-    template_fb = _finalize_threat_bullets(
-        template_fb,
-        crime_count=crime_count,
-        reports_count=reports_count,
-        permit_count=permit_count,
-        eviction_count=eviction_count,
-        noise_count=noise_count,
-        construction_311_count=construction_311_count,
-        flight_path=flight_path if show_flight else None,
-        flight_exposure=flight_exposure,
-        scan_radius_miles=scan_radius_miles,
-    )
 
     pending_ctx = PendingBulletsContext(
         address=address,
         coord=coord,
-        crime=crime,
-        reports_311=reports_311,
-        permits=permits,
-        evictions=evictions,
+        facts=facts,
         logistics=logistics,
         flight_path=flight_path if show_flight else None,
         flight_exposure=flight_exposure,
-        crime_count=crime_count,
-        reports_count=reports_count,
-        permit_count=permit_count,
-        eviction_count=eviction_count,
-        noise_count=noise_count,
-        construction_311_count=construction_311_count,
         chrome_ctx=chrome_ctx,
-        template_fb=template_fb,
+        template_bullets=template,
         risk=risk,
-        scan_radius_miles=scan_radius_miles,
         cache_key=cache_key,
     )
 
     if defer_gemini:
-        bullets_token = _store_pending(pending_ctx)
-        result = {
+        return {
             **risk,
-            "threat_cards": _visible_threat_cards(template_fb, chrome_ctx),
-            "bullets_token": bullets_token,
+            "threat_cards": _visible_threat_cards(template, chrome_ctx),
+            "bullets_token": _store_pending(pending_ctx),
             **_gemini_meta(configured=True, status="pending"),
         }
-        return result
 
     result = await _run_gemini_bullets(pending_ctx)
-    _analysis_cache[cache_key] = result
+    _cache_put(cache_key, result)
     return result

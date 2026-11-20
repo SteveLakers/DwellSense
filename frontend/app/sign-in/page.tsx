@@ -4,11 +4,15 @@ import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 import {
   AuthAlert,
+  AuthDivider,
   AuthField,
   AuthShell,
+  authFooterClassName,
   authGoogleButtonClassName,
   authInputClassName,
+  authLinkClassName,
   authPrimaryButtonClassName,
+  GoogleMark,
 } from "@/components/AuthShell";
 import { useAuth } from "@/components/AuthProvider";
 import { isValidEmail } from "@/lib/auth/email";
@@ -82,11 +86,12 @@ export default function SignInPage() {
 
   return (
     <AuthShell
-      subtitle="Sign in to save reports (coming next)."
+      title="Sign in"
+      subtitle="Saving reports to your account is coming next."
       footer={
-        <p className="mt-4 text-center text-sm text-slate-400">
+        <p className={authFooterClassName}>
           No account?{" "}
-          <Link href="/sign-up" className="text-rose-400 hover:text-rose-300 font-medium">
+          <Link href="/sign-up" className={authLinkClassName}>
             Sign up
           </Link>
         </p>
@@ -95,8 +100,8 @@ export default function SignInPage() {
       {!isConfigured && (
         <AuthAlert tone="warn">
           Supabase Auth keys are not set. Add{" "}
-          <code className="text-amber-200">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
-          <code className="text-amber-200">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> on Vercel and
+          <code className="font-mono text-[13px]">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+          <code className="font-mono text-[13px]">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> on Vercel and
           locally.
         </AuthAlert>
       )}
@@ -108,19 +113,13 @@ export default function SignInPage() {
         disabled={loading || !isConfigured}
         className={authGoogleButtonClassName}
       >
+        <GoogleMark />
         {loading ? "Redirecting…" : "Continue with Google"}
       </button>
 
-      <div className="relative my-4">
-        <div className="absolute inset-0 flex items-center">
-          <div className="w-full border-t border-slate-700" />
-        </div>
-        <div className="relative flex justify-center text-xs uppercase">
-          <span className="bg-slate-900 px-2 text-slate-500">or email</span>
-        </div>
-      </div>
+      <AuthDivider label="or email" />
 
-      <form onSubmit={onEmailSignIn} noValidate className="space-y-3">
+      <form onSubmit={onEmailSignIn} noValidate className="space-y-4">
         <AuthField label="Email">
           <input
             type="text"
@@ -142,10 +141,10 @@ export default function SignInPage() {
             className={authInputClassName}
           />
         </AuthField>
-        <div className="flex justify-end">
+        <div className="-mt-1 flex justify-end">
           <Link
             href="/forgot-password"
-            className="text-xs text-slate-400 hover:text-rose-300 transition-colors"
+            className="rounded-sm py-1 text-sm font-medium text-fg-2 underline-offset-[3px] transition-colors hover:text-fg hover:underline"
           >
             Forgot password?
           </Link>

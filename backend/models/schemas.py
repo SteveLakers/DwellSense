@@ -46,8 +46,11 @@ class ThreatCard(BaseModel):
     border_color: str
     text_color: str
     bullets: list[str]
-    # quiet | watch | elevated — drives badge + card wash in the UI
-    severity_level: Literal["quiet", "watch", "elevated"] = "quiet"
+    # quiet / watch / elevated = lower than / about / higher than typical NYC apartment locations.
+    # unavailable = source did not answer; not_checked = no data source wired; tip = general advice.
+    severity_level: Literal["quiet", "watch", "elevated", "unavailable", "not_checked", "tip"] = "unavailable"
+    # Share of sampled NYC apartment locations with a lower count (0–100), when measured.
+    nyc_percentile: int | None = None
 
 
 class BulletsRequest(BaseModel):
@@ -70,6 +73,8 @@ class Zone(BaseModel):
     radius_meters: int
     color: str
     label: str
+    # Record source + date, e.g. "311 request · Sep 30, 2026"
+    detail: str | None = None
 
 
 class SwarmPin(BaseModel):
@@ -77,6 +82,21 @@ class SwarmPin(BaseModel):
     lng: float
     type: Literal["police", "rat", "permit", "truck", "bus", "noise", "fire", "water", "trash", "graffiti", "construction", "report"]
     label: str
+    detail: str | None = None
+
+
+class DataSource(BaseModel):
+    key: str
+    label: str
+    status: Literal["ok", "unavailable"]
+    count: int | None = None
+    # ISO dates (YYYY-MM-DD). window_* = records counted; as_of = newest record the source has published.
+    window_start: str | None = None
+    window_end: str | None = None
+    as_of: str | None = None
+    provider: str
+    note: str | None = None
+    url: str | None = None
 
 
 class FlightPath(BaseModel):
@@ -96,7 +116,7 @@ class FlightPath(BaseModel):
 
 
 class FlightExposure(BaseModel):
-    # Approx overflights per hour within the chosen radius/altitude band.
+    # Distinct aircraft passes per covered hour inside the scan radius (a pass ends after 10 min unseen).
     night_overflights_per_hour: float
     day_overflights_per_hour: float
     # Typical altitude of nearby overflights (median), if available.
@@ -122,8 +142,10 @@ class MapData(BaseModel):
     target: Coordinate
     zones: list[Zone]
     swarm: list[SwarmPin]
-    # Unique real geocodes in the 2-mile scan (may exceed len(swarm) when map caps pins for readability).
+    # Unique real geocodes among loaded records (may exceed len(swarm) when map caps pins for readability).
     swarm_location_total: int | None = None
+    # True when only the newest records were loaded for the map, so more locations exist.
+    swarm_total_is_lower_bound: bool = False
     # Municipal + flight overlay radius (miles) used for this scan.
     scan_radius_miles: float | None = None
     # Multiple nearby corridors (nearest first). `flight_path` is kept for backwards compatibility.
@@ -151,6 +173,12 @@ class ScanResponse(BaseModel):
     risk_description: str
     # Primary factor behind banner copy: area_safety | 311 | permits | evictions | noise
     banner_driver: str | None = None
+    # False when too few sources answered to compute a Wellness Score (danger_score is then 0 and unused).
+    score_available: bool = True
+    # Sources that answered vs. were unavailable, with the date range each count covers.
+    data_sources: list[DataSource] = []
+    # Day (YYYY-MM-DD) the NYC comparison counts were measured (backend/data/nyc_baselines.json).
+    nyc_comparison_as_of: str | None = None
     logistics: list[LogisticsCard]
     dining: list[RestaurantBarCard] = []
     threat_cards: list[ThreatCard]

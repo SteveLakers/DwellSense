@@ -1,6 +1,10 @@
+import { formatCount, plural, stripLeadingEmoji } from "@/lib/format";
+
 export interface ScanSummaryProps {
   score: number;
+  scoreAvailable?: boolean;
   riskLabel: string;
+  swarmTotalIsLowerBound?: boolean;
   address: string;
   swarmShown: number;
   swarmTotal: number | null;
@@ -23,7 +27,7 @@ function truncateAddress(address: string, max = 42): string {
 
 export default function SideAds({ summary }: Props) {
   return (
-    <div className="hidden fixed inset-0 pointer-events-none z-30 top-[76px]">
+    <div className="hidden fixed inset-0 pointer-events-none z-30 top-16">
       <div className="w-full h-full flex justify-between items-start max-w-[1640px] mx-auto pt-[40px] px-2 xl:px-4">
 
         {summary ? (
@@ -38,13 +42,19 @@ export default function SideAds({ summary }: Props) {
                 <div className="text-[9px] font-black uppercase tracking-widest text-slate-500 mb-1">
                   Wellness score
                 </div>
-                <div className="text-3xl font-black text-yellow-400 leading-none">
-                  {summary.score}
-                  <span className="text-sm text-slate-600">/100</span>
-                </div>
-                <div className="text-[10px] font-bold text-slate-300 mt-1 uppercase leading-snug">
-                  {summary.riskLabel.replace(/^[^\s]+\s*/, "")}
-                </div>
+                {summary.scoreAvailable === false ? (
+                  <div className="text-xl font-black text-slate-400 leading-none uppercase">Not scored</div>
+                ) : (
+                  <>
+                    <div className="text-3xl font-black text-yellow-400 leading-none">
+                      {summary.score}
+                      <span className="text-sm text-slate-600">/100</span>
+                    </div>
+                    <div className="text-[10px] font-bold text-slate-300 mt-1 uppercase leading-snug">
+                      {stripLeadingEmoji(summary.riskLabel)}
+                    </div>
+                  </>
+                )}
               </div>
               <div className="border-t border-slate-700/80 pt-3">
                 <div className="text-[9px] font-black uppercase tracking-widest text-slate-500 mb-1">
@@ -58,12 +68,15 @@ export default function SideAds({ summary }: Props) {
                 <p>
                   Map:{" "}
                   <span className="text-white">
-                    {summary.swarmTotal != null && summary.swarmTotal > summary.swarmShown
-                      ? `${summary.swarmShown} of ${summary.swarmTotal}`
-                      : summary.swarmShown}{" "}
-                    pins
+                    {summary.swarmTotal != null &&
+                    (summary.swarmTotal > summary.swarmShown || summary.swarmTotalIsLowerBound)
+                      ? `${formatCount(summary.swarmShown)} of ${formatCount(summary.swarmTotal)}${
+                          summary.swarmTotalIsLowerBound ? "+" : ""
+                        }`
+                      : formatCount(summary.swarmShown)}{" "}
+                    {plural(summary.swarmShown, "pin")}
                   </span>
-                  <span className="text-slate-500"> ({summary.scanRadiusMi}-mi)</span>
+                  <span className="text-slate-500"> (within {summary.scanRadiusMi} mi)</span>
                 </p>
                 <p>
                   {summary.showFlightFeature ? (
@@ -75,7 +88,7 @@ export default function SideAds({ summary }: Props) {
                       {summary.flightPathCount > 0 ? (
                         <span className="text-slate-500">
                           {" "}
-                          · {summary.flightPathCount} track(s) on map
+                          · {summary.flightPathCount} {plural(summary.flightPathCount, "track")} on map
                         </span>
                       ) : null}
                     </>
@@ -87,7 +100,7 @@ export default function SideAds({ summary }: Props) {
                 </p>
               </div>
               <p className="mt-auto text-[9px] text-slate-500 leading-snug border-t border-slate-700/80 pt-3">
-                Swipe the threat carousel below — {summary.threatCardCount ?? 9} cards total.
+                {summary.threatCardCount ?? 0} threat {plural(summary.threatCardCount ?? 0, "card")} below.
               </p>
             </div>
           </div>

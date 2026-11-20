@@ -13,6 +13,25 @@ logger = logging.getLogger(__name__)
 
 GEOCODE_URL = "https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json"
 
+# The five boroughs, as Mapbox names their counties in a feature's `district` context.
+NYC_COUNTIES = frozenset({"New York County", "Kings County", "Queens County", "Bronx County", "Richmond County"})
+
+
+def nyc_county(feature: dict) -> str | None:
+    """County name when the geocoded feature is inside NYC, else None.
+
+    Don't pass a bbox to Mapbox instead: it then forces a match inside the box, turning
+    "123 Main St, Syracuse" into a Staten Island street without saying so.
+    """
+    ctx = feature.get("context") or []
+    region = next((c for c in ctx if str(c.get("id", "")).startswith("region.")), {})
+    if region.get("short_code") != "US-NY":
+        return None
+    for c in ctx:
+        if str(c.get("id", "")).startswith("district.") and c.get("text") in NYC_COUNTIES:
+            return c["text"]
+    return None
+
 
 def _geocode_attempts() -> int:
     try:
@@ -116,5 +135,10 @@ async def geocode(address: str) -> tuple[Coordinate, str]:
             f"Address not found: '{address}'. Try adding a city or zip code."
         ) from e
     formatted = best.get("place_name", address)
+    if nyc_county(best) is None:
+        raise ValueError(
+            f"ZerMap covers New York City only, and '{address}' matched {formatted}. "
+            "Add the borough or ZIP code, e.g. 350 W 42nd St, New York, NY 10036."
+        )
 
     return Coordinate(lat=lat, lng=lng), formatted
