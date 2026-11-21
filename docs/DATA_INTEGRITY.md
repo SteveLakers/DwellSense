@@ -2,7 +2,7 @@
 
 **ALWAYS USE REAL DATA. NEVER FAKE OR MAKE UP ANY DATA.**
 
-This file exists so Graphify and Claude Code always have a dedicated, searchable node for ZerMap’s data-truth law. Full product context: `project.md` → **Data integrity**. Always-on rule: `.claude/rules/data-integrity.md` (Claude Code); `.cursor/rules/data-integrity.mdc` is an unmaintained Cursor leftover.
+This file exists so Graphify and Cursor always have a dedicated, searchable node for ZerMap’s data-truth law. Full product context: `project.md` → **Data integrity**.
 
 ## Law
 
@@ -22,7 +22,7 @@ Every user-visible number, pin, score input, listing, and map marker must trace 
 | **No invented records** | Do not place pins, counts, or incidents that are not in the fetched datasets. |
 | **No synthetic fallbacks on the map** | Do not draw heuristic flight corridors, random jitter, or demo swarms when live data is missing — show **nothing** or label **unavailable**. |
 | **Truncation must be honest** | If the map shows a subset of real locations for readability, the UI must say so (e.g. “Showing 100 of 1,896 real locations”). Scoring and risk copy still use the **full** in-radius counts. |
-| **Unavailable means unavailable** | If an API or table has no data, return empty / `unavailable` — never approximate without clear labeling. A missing count is never shown as 0, and a comparison that needs several sources (e.g. the Construction card: permits + 311) is unavailable when any of them is missing. |
+| **Unavailable means unavailable** | If an API or table has no data, return empty / `unavailable` — never approximate without clear labeling. |
 | **PDF / external links** | Every dossier hyperlink must open a **real external source page already filtered** to the address, scan area, or exact record — never a site homepage and never a localhost proxy. |
 
 ## Allowed (display-only, not new facts)

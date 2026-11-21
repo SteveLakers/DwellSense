@@ -6,14 +6,13 @@ from __future__ import annotations
 import json
 import re
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-ADDR = sys.argv[1] if len(sys.argv) > 1 else "350 W 42nd St, New York, NY 10036"
+ADDR = "742 Lefferts Ave, Brooklyn, NY 11203"
 BACKEND = "http://127.0.0.1:8000"
 FRONTEND = "http://localhost:3000"
 
@@ -61,23 +60,15 @@ def http_json(method: str, url: str, payload: dict | None = None, timeout: int =
             return e.code, raw.decode(errors="replace"), "", raw
 
 
-def http_get(url: str, timeout: int = 25, attempts: int = 4) -> tuple[int, bytes]:
-    """GET with retries on throttling / transient server errors, so only real link problems fail."""
+def http_get(url: str, timeout: int = 25) -> tuple[int, bytes]:
     req = urllib.request.Request(url, headers={"User-Agent": "ZerMap-StrictAudit/1.0"})
-    status, body = -1, b""
-    for attempt in range(attempts):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            status, body = e.code, e.read() if e.fp else b""
-            if status not in (429, 500, 502, 503, 504):
-                return status, body
-        except Exception as e:
-            status, body = -1, str(e).encode()
-        if attempt < attempts - 1:
-            time.sleep(5 * (attempt + 1))
-    return status, body
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read() if e.fp else b""
+    except Exception as e:
+        return -1, str(e).encode()
 
 
 def extract_pdf_uris(pdf: bytes) -> list[str]:
@@ -166,10 +157,6 @@ def classify(url: str) -> str:
         if "aircraft-profile" in url or "/network/explorer/" in url:
             return "opensky_deep"
         return "opensky_other"
-    if host == "adsb.lol":
-        if re.search(r"[?&](icao=[a-f0-9]{6}|lat=-?\d)", url):
-            return "adsb_deep"
-        return "adsb_other"
     if "google." in host or "maps.google." in host:
         if "query=" in qs or "/maps/" in path or "cid=" in qs or "cid=" in url:
             return "maps_deep"
@@ -252,8 +239,6 @@ def main() -> int:
         fail(f"NYC non-explore link: {u[:140]}")
     for u in by_class.get("opensky_other", []):
         fail(f"OpenSky non-deep link: {u}")
-    for u in by_class.get("adsb_other", []):
-        fail(f"adsb.lol link without an aircraft or location: {u}")
     for u in by_class.get("maps_other", []):
         fail(f"Maps non-deep link: {u}")
     for u in by_class.get("yelp_other", []):
@@ -282,24 +267,13 @@ def main() -> int:
         n, err = soda_rows(ds, where)
         is_record = bool(
             re.search(
-                r"\b(cmplnt_num|unique_key|job__|docket_number|court_index_number|housenumber|"
-                r"cad_evnt_id|work_permit|permit_si_no)\s*=",
+                r"\b(cmplnt_num|unique_key|job__|docket_number|court_index_number|housenumber)\s*=",
                 where,
             )
         )
         is_area = bool(
-            re.search(r"within_circle|latitude\s+between|like\s+'%|borough\s*=|boro\s*=", where, flags=re.I)
+            re.search(r"within_circle|like\s+'%|borough\s*=|boro\s*=", where, flags=re.I)
         )
-        if n == 0 and is_record:
-            # Lookups of records from the last day or two sometimes come back empty at random (seen on
-            # 311, Oct 2026); asking again finds them. Each retry varies $limit so it isn't a repeat request.
-            for retry_limit in (7, 9, 11, 13, 15):
-                time.sleep(2)
-                n, err = soda_rows(ds, where, limit=retry_limit)
-                if n != 0:
-                    break
-            if n > 0:
-                warn(f"[{i}/{len(explores)}] record {ds}: empty at first, found on a retry: {where[:120]}")
         if n < 0:
             fail(f"[{i}/{len(explores)}] SODA error {ds}: {err}\n         WHERE={where[:160]}")
             soda_errors += 1
@@ -333,8 +307,6 @@ def main() -> int:
             ok(f"opensky deep: {u[:110]}")
         else:
             fail(f"opensky unexpected: {u}")
-    for u in by_class.get("adsb_deep", []):
-        ok(f"adsb.lol deep: {u[:110]}")
 
     # 6) Sanity: link counts / hosts
     print("\n=== 6) HOST SUMMARY ===")

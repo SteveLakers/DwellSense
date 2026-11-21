@@ -19,8 +19,8 @@ from services.city_data import _get_client, get_scan_radius_miles
 
 OPENSKY_USERNAME = os.getenv("OPENSKY_USERNAME", "")
 OPENSKY_PASSWORD = os.getenv("OPENSKY_PASSWORD", "")
-# auto: Supabase adsb_samples polylines (no per-scan OpenSky); no paths when samples are absent.
-# static: labeled demo corridor segments only. live_adsb: capped OpenSky track API (no paths when empty/slow).
+# auto: Supabase adsb_samples polylines (no per-scan OpenSky), then static corridors.
+# static: corridor segments only. live_adsb: capped OpenSky track API (may still be slow/unavailable).
 # "adsb" is treated as "auto" for backward compatibility (old adsb hammered OpenSky every scan).
 FLIGHT_MODE = (os.getenv("FLIGHT_MODE", "auto") or "auto").strip().lower()
 logger = logging.getLogger(__name__)
@@ -1426,8 +1426,8 @@ async def get_flight_paths(
       otherwise returns no flight paths (no synthetic corridors).
     - ``static``: simplified hand-authored corridor segments only — same “demo” dashed
       straight segments (no per-aircraft tracks).
-    - ``live_adsb``: capped OpenSky ``states`` + a few sequential ``tracks`` calls; returns
-      no paths if empty or slow.
+    - ``live_adsb``: capped OpenSky ``states`` + a few sequential ``tracks`` calls; falls
+      back to static if empty or slow.
     - ``adsb`` is accepted as an alias for ``auto`` (legacy env files).
     """
     mode = (FLIGHT_MODE or "auto").strip().lower()

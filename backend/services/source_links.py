@@ -6,76 +6,66 @@ pre-filtered to the scanned address, scan radius, or exact dossier record.
 
 from __future__ import annotations
 
+import math
 import re
-from datetime import date
-from typing import Literal
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from models.schemas import Coordinate
-from services import city_data
 
 _BASE = "https://data.cityofnewyork.us"
 
-# "feed" is the scan feed whose date window the browse link reuses.
-_DATASETS: dict[str, dict[str, str]] = {
+_DATASETS: dict[str, dict[str, object]] = {
     "crime": {
+        "id": "5uac-w243",
         "path": "Public-Safety/NYPD-Complaint-Data-Current-Year-To-Date-/5uac-w243",
-        "feed": "crime",
         "id_field": "cmplnt_num",
+        "geo_mode": "within_circle",
+        "geo_field": "lat_lon",
+        "date_field": "cmplnt_fr_dt",
+        "date_cast": "floating_timestamp",
         "order_field": "cmplnt_fr_dt",
         "label": "NYPD Complaint Data (NYC Open Data)",
-        "select": "cmplnt_num,cmplnt_fr_dt,ofns_desc,pd_desc,law_cat_cd,boro_nm,latitude,longitude",
-    },
-    "police_calls": {
-        "path": "Public-Safety/NYPD-Calls-for-Service-Year-to-Date-/n2zq-pubd",
-        "feed": "police_calls",
-        "id_field": "cad_evnt_id",
-        "order_field": "incident_date",
-        "label": "NYPD Calls for Service (NYC Open Data)",
-        "select": "cad_evnt_id,incident_date,incident_time,typ_desc,cip_jobs,boro_nm,latitude,longitude",
+        "select": "cmplnt_num,cmplnt_fr_dt,ofns_desc,pd_desc,boro_nm,latitude,longitude",
     },
     "311": {
-        "path": "Social-Services/311-Service-Requests-from-2020-to-Present/erm2-nwe9",
-        "feed": "311",
+        "id": "erm2-nwe9",
+        "path": "Social-Services/311-Service-Requests-from-2010-to-Present/erm2-nwe9",
         "id_field": "unique_key",
+        "geo_mode": "within_circle",
+        "geo_field": "location",
+        "address_field": "incident_address",
+        "date_field": "created_date",
+        "date_cast": "floating_timestamp",
         "order_field": "created_date",
         "label": "311 Service Requests (NYC Open Data)",
         "select": "unique_key,created_date,complaint_type,descriptor,borough,incident_address,latitude,longitude",
     },
-    "permits_now": {
-        "path": "Housing-Development/DOB-NOW-Build-Approved-Permits/rbx6-tga4",
-        "feed": "permits",
-        "id_field": "work_permit",
-        "id_prefix": "NOW:",
-        "order_field": "issued_date",
-        "label": "DOB NOW: Build Approved Permits (NYC Open Data)",
-        "select": (
-            "work_permit,issued_date,expired_date,work_type,permit_status,job_description,"
-            "house_no,street_name,borough,latitude,longitude"
-        ),
-    },
     "permits": {
+        "id": "ipu4-2q9a",
         "path": "Housing-Development/DOB-Permit-Issuance/ipu4-2q9a",
-        "feed": "permits",
-        "id_field": "permit_si_no",
-        "id_prefix": "BIS:",
-        "order_field": "dobrundate",
+        "id_field": "job__",
+        "geo_mode": "borough",
+        "borough_field": "borough",
+        "address_field": "street_name",
+        "date_field": None,
+        "order_field": "filing_date",
         "label": "DOB Permit Issuance (NYC Open Data)",
-        "select": (
-            "permit_si_no,job__,issuance_date,expiration_date,permit_type,permit_subtype,job_type,"
-            "permit_status,house__,street_name,borough,gis_latitude,gis_longitude"
-        ),
+        "select": "job__,filing_date,permit_type,permit_status,street_name,borough,gis_latitude,gis_longitude",
     },
     "evictions": {
+        "id": "6z8x-wfk4",
         "path": "City-Government/Evictions/6z8x-wfk4",
-        "feed": "evictions",
         "id_field": "docket_number",
+        "alt_id_field": "court_index_number",
+        "geo_mode": "borough",
+        "borough_field": "borough",
+        "address_field": "eviction_address",
+        "date_field": "executed_date",
+        "date_cast": "floating_timestamp",
         "order_field": "executed_date",
         "label": "Evictions (NYC Open Data)",
-        "select": (
-            "court_index_number,docket_number,eviction_address,executed_date,"
-            "residential_commercial_ind,borough,latitude,longitude"
-        ),
+        "select": "court_index_number,docket_number,eviction_address,executed_date,borough,latitude,longitude",
     },
 }
 
@@ -88,18 +78,23 @@ _HPD_VIOLATIONS: dict[str, str] = {
     "order_field": "novissueddate",
 }
 
-# (dataset key, 311 subset) per card; subsets mirror city_data.is_311_noise / is_311_construction.
-_CARD_DATASETS: dict[str, list[tuple[str, str | None]]] = {
-    "high_churn": [("evictions", None)],
-    "police_calls": [("police_calls", None)],
-    "area_safety": [("crime", None)],
-    "demolitions": [("permits_now", None), ("permits", None), ("311", "construction")],
-    "noise_schedule": [("311", "noise")],
-    "reports_311": [("311", None)],
+_CARD_DATASET_KEYS: dict[str, list[str]] = {
+    "high_churn": ["evictions"],
+    "police_calls": ["crime"],
+    "area_safety": ["crime"],
+    "demolitions": ["permits", "311"],
+    "noise_schedule": ["311"],
+    "reports_311": ["311"],
 }
 
-CARD_DATASET_KEYS: dict[str, list[str]] = {
-    card: [key for key, _ in specs] for card, specs in _CARD_DATASETS.items()
+CARD_DATASET_KEYS = _CARD_DATASET_KEYS
+
+_BOROUGH_ALIASES: dict[str, tuple[str, ...]] = {
+    "MANHATTAN": ("MANHATTAN", "NEW YORK"),
+    "BROOKLYN": ("BROOKLYN", "KINGS"),
+    "QUEENS": ("QUEENS",),
+    "BRONX": ("BRONX",),
+    "STATEN ISLAND": ("STATEN ISLAND", "RICHMOND", "STATEN"),
 }
 
 _STREET_SUFFIX_RE = re.compile(
@@ -111,20 +106,21 @@ _HOUSE_STREET_RE = re.compile(r"^(\d+[A-Z]?)\s+(.+)$", re.IGNORECASE)
 _ICAO_FROM_LABEL_RE = re.compile(r"\(([a-f0-9]{6})\b", re.IGNORECASE)
 
 _RECORD_LIMIT = 10
-# Rows an NYC Open Data explore link lists (newest first). The PDF states this next to each link.
-BROWSE_LIMIT = 200
-_BROWSE_LIMIT = BROWSE_LIMIT
+_BROWSE_LIMIT = 200
 _MAX_ID_CLAUSES = 50
-
-LinkScope = Literal["scan", "records"]
 
 
 def _soql_escape(value: str) -> str:
     return (value or "").replace("'", "''")
 
 
+def _since_timestamp(days_back: int) -> str:
+    since = datetime.now(timezone.utc) - timedelta(days=days_back)
+    return since.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def _explore_url(dataset_key: str, soql: str) -> str:
-    path = _DATASETS[dataset_key]["path"]
+    path = str(_DATASETS[dataset_key]["path"])
     return f"{_BASE}/{path}/explore/query/{quote(soql, safe='')}"
 
 
@@ -133,9 +129,21 @@ def _hpd_explore_url(soql: str) -> str:
     return f"{_BASE}/{path}/explore/query/{quote(soql, safe='')}"
 
 
-def _select_soql(dataset_key: str, *, where: str, limit: int) -> str:
+def _select_soql(
+    dataset_key: str,
+    *,
+    where: str,
+    limit: int,
+    order: bool = True,
+) -> str:
     meta = _DATASETS[dataset_key]
-    return f"SELECT {meta['select']} WHERE {where} ORDER BY {meta['order_field']} DESC LIMIT {limit}"
+    select = str(meta["select"])
+    order_field = str(meta["order_field"])
+    soql = f"SELECT {select} WHERE {where}"
+    if order:
+        soql += f" ORDER BY {order_field} DESC"
+    soql += f" LIMIT {limit}"
+    return soql
 
 
 def parse_address_parts(formatted_address: str) -> dict[str, str | None]:
@@ -165,9 +173,12 @@ def street_token_from_address(formatted_address: str) -> str | None:
     parts = [p for p in without_suffix.split() if p]
     if not parts:
         return None
-    # "W 42ND" / "EAST 14" — prefer the street name over a compass prefix.
+    # "W 42ND" / "EAST 14" — prefer the numeric street name over a compass prefix.
     if len(parts) >= 2 and parts[0] in {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST"}:
-        token = parts[1]
+        if re.search(r"\d", parts[1]):
+            token = parts[1]
+        else:
+            token = parts[1]
     else:
         token = parts[0]
     # HPD/Open Data store numbered streets as "WEST 42 STREET", not "42ND".
@@ -194,79 +205,134 @@ def borough_from_address(formatted_address: str) -> str | None:
     return None
 
 
-def _scan_where(
+def _borough_where(dataset_key: str, borough: str) -> str:
+    meta = _DATASETS[dataset_key]
+    field = str(meta.get("borough_field", "borough"))
+    aliases = _BOROUGH_ALIASES.get(borough.upper(), (borough.upper(),))
+    if len(aliases) == 1:
+        return f"{field}='{_soql_escape(aliases[0])}'"
+    inner = " OR ".join(f"{field}='{_soql_escape(alias)}'" for alias in aliases)
+    return f"({inner})"
+
+
+def _geo_where(
     dataset_key: str,
     coord: Coordinate,
-    *,
     radius_miles: float,
-    start: date,
-    end: date,
-    subset: str | None,
-) -> str | None:
-    """SoQL WHERE identical to the scan's count for this dataset.
-
-    None for BIS permits and evictions: their coordinates are text, and the
-    casts the radius filter needs are not reliable on explore pages.
-    """
-    if dataset_key == "crime":
-        return city_data.crime_where(coord, start, end, radius_miles=radius_miles)
-    if dataset_key == "police_calls":
-        return city_data.police_calls_where(coord, start, end, radius_miles=radius_miles)
-    if dataset_key == "311":
-        where = city_data.reports_311_where(coord, start, radius_miles=radius_miles, exclude_parking=True)
-        if subset == "noise":
-            where += f" AND {city_data.soql_311_noise()}"
-        elif subset == "construction":
-            where += f" AND {city_data.soql_311_construction()}"
-        return where
-    if dataset_key == "permits_now":
-        return city_data.permits_now_where(coord, start, end, radius_miles=radius_miles)
-    return None
+    *,
+    borough: str | None = None,
+) -> str:
+    meta = _DATASETS[dataset_key]
+    mode = meta.get("geo_mode", "")
+    if mode == "within_circle":
+        radius_m = radius_miles * 1609.344
+        field = meta["geo_field"]
+        return f"within_circle({field}, {coord.lat:.6f}, {coord.lng:.6f}, {radius_m:.0f})"
+    if mode == "borough" and borough:
+        return _borough_where(dataset_key, borough)
+    return "1=1"
 
 
-def record_dataset_key(default_key: str, source_id: str) -> str:
-    """DOB permit rows carry a NOW:/BIS: prefix that picks the dataset."""
-    sid = (source_id or "").strip()
-    if default_key in ("permits", "permits_now"):
-        return "permits_now" if sid.startswith("NOW:") else "permits"
-    return default_key
+def _date_where(dataset_key: str, days_back: int) -> str | None:
+    meta = _DATASETS[dataset_key]
+    field = meta.get("date_field")
+    if not field:
+        return None
+    # Match city_data._since_socrata / live fetch: >= ISO timestamp, no cast.
+    # The :: floating_timestamp cast is unnecessary and has blanked explore pages.
+    since = _since_timestamp(days_back)
+    return f"{field} >= '{since}'"
+
+
+def _address_where(dataset_key: str, formatted_address: str) -> str | None:
+    meta = _DATASETS[dataset_key]
+    field = meta.get("address_field")
+    token = street_token_from_address(formatted_address)
+    if not field or not token:
+        return None
+    escaped = _soql_escape(token)
+    if dataset_key == "permits":
+        return f"upper({field}) like '%{escaped}%'"
+    return f"upper({field}) like '%{escaped}%'"
 
 
 def _id_clause(dataset_key: str, source_id: str) -> str | None:
     raw = (source_id or "").strip()
-    meta = _DATASETS[dataset_key]
-    prefix = meta.get("id_prefix")
-    if prefix and raw.startswith(prefix):
-        raw = raw[len(prefix):]
     if not raw:
         return None
-    # Every id field used here is text; unquoted values cause type-mismatch 400s and blank explore pages.
-    if dataset_key == "evictions" and ":" in raw:
-        court, docket, executed = (raw.split(":", 2) + ["", ""])[:3]
-        parts = [f"{f}='{_soql_escape(v)}'" for f, v in (("court_index_number", court), ("docket_number", docket)) if v]
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", executed):
-            parts.append(f"executed_date='{executed}T00:00:00'")
-        return "(" + " AND ".join(parts) + ")" if parts else None
-    return f"{meta['id_field']}='{_soql_escape(raw)}'"
+    meta = _DATASETS[dataset_key]
+    field = str(meta["id_field"])
+    if dataset_key == "permits":
+        raw = raw.split("_", 1)[0]
+    # All NYC Open Data id fields used here are text (cmplnt_num, unique_key,
+    # job__, docket_number). Unquoted numeric SoQL causes type-mismatch 400s
+    # and blank explore pages for table "View" links.
+    value = _soql_escape(raw)
+    clause = f"{field}='{value}'"
+    alt = meta.get("alt_id_field")
+    if alt and "/" in raw:
+        alt_val = _soql_escape(raw)
+        clause = f"({clause} OR {alt}='{alt_val}')"
+    return clause
+
+
+def dataset_home_url(dataset_key: str) -> str:
+    return f"{_BASE}/{_DATASETS[dataset_key]['path']}"
 
 
 def dataset_label(dataset_key: str) -> str:
-    return _DATASETS[dataset_key]["label"]
+    return str(_DATASETS[dataset_key]["label"])
+
+
+def _browse_where_parts(
+    dataset_key: str,
+    coord: Coordinate,
+    *,
+    radius_miles: float,
+    days_back: int | None,
+    formatted_address: str,
+) -> list[str]:
+    borough = borough_from_address(formatted_address)
+    parts: list[str] = []
+
+    addr = _address_where(dataset_key, formatted_address)
+    if addr:
+        parts.append(addr)
+
+    geo = _geo_where(dataset_key, coord, radius_miles, borough=borough)
+    if geo != "1=1":
+        parts.append(geo)
+
+    # Crime YTD feed often has no incidents inside a short rolling window for a
+    # given block even when nearby older YTD rows exist. Date-filtering browse
+    # links then opens a blank NYC Open Data table. Prefer exact dossier IDs
+    # when available; for open browse, keep area/geo filters only for crime.
+    if days_back is not None and dataset_key != "crime":
+        date_part = _date_where(dataset_key, days_back)
+        if date_part:
+            parts.append(date_part)
+
+    return parts
 
 
 def record_url(dataset_key: str, source_id: str) -> str | None:
     """NYC Open Data explorer filtered to one dossier record."""
-    dataset_key = record_dataset_key(dataset_key, source_id)
     clause = _id_clause(dataset_key, source_id)
     if not clause:
         return None
-    return _explore_url(dataset_key, _select_soql(dataset_key, where=clause, limit=_RECORD_LIMIT))
+    soql = _select_soql(dataset_key, where=clause, limit=_RECORD_LIMIT)
+    return _explore_url(dataset_key, soql)
 
 
 def dossier_records_url(dataset_key: str, source_ids: list[str]) -> str | None:
     """NYC Open Data explorer filtered to exact dossier record IDs."""
     clauses: list[str] = []
-    for sid in dict.fromkeys(s.strip() for s in source_ids if s and s.strip()):
+    seen: set[str] = set()
+    for raw_id in source_ids:
+        sid = (raw_id or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
         clause = _id_clause(dataset_key, sid)
         if clause:
             clauses.append(clause)
@@ -275,7 +341,45 @@ def dossier_records_url(dataset_key: str, source_ids: list[str]) -> str | None:
     if not clauses:
         return None
     where = clauses[0] if len(clauses) == 1 else "(" + ") OR (".join(clauses) + ")"
-    return _explore_url(dataset_key, _select_soql(dataset_key, where=where, limit=min(_BROWSE_LIMIT, len(clauses))))
+    soql = _select_soql(
+        dataset_key,
+        where=where,
+        limit=min(_BROWSE_LIMIT, max(len(clauses), 1)),
+    )
+    return _explore_url(dataset_key, soql)
+
+
+def radius_browse_url(
+    dataset_key: str,
+    coord: Coordinate,
+    *,
+    radius_miles: float,
+    days_back: int | None = None,
+    formatted_address: str = "",
+    source_ids: list[str] | None = None,
+) -> str:
+    """NYC Open Data explorer filtered to the scan area around the subject address."""
+    if source_ids:
+        exact = dossier_records_url(dataset_key, source_ids)
+        if exact:
+            return exact
+
+    parts = _browse_where_parts(
+        dataset_key,
+        coord,
+        radius_miles=radius_miles,
+        days_back=days_back,
+        formatted_address=formatted_address,
+    )
+    if not parts:
+        return dataset_home_url(dataset_key)
+
+    soql = _select_soql(
+        dataset_key,
+        where=" AND ".join(parts),
+        limit=_BROWSE_LIMIT,
+    )
+    return _explore_url(dataset_key, soql)
 
 
 def card_dataset_urls(
@@ -283,66 +387,78 @@ def card_dataset_urls(
     coord: Coordinate,
     *,
     radius_miles: float,
-    windows: dict[str, tuple[date, date]],
+    crime_days: int,
+    reports_311_days: int,
+    permit_days: int,
+    eviction_days: int,
+    formatted_address: str = "",
     dossier_ids: dict[str, list[str]] | None = None,
-) -> list[tuple[str, str, str, LinkScope]]:
-    """(label, url, dataset key, scope) for each dataset behind a card.
-
-    scope "scan": the link applies the scan's own filter (same records as the count).
-    scope "records": the link lists the exact records shown in the report.
-    `windows` maps feed keys to the scan's (start, end) dates; datasets whose feed
-    was unavailable during the scan get no link.
-    """
-    out: list[tuple[str, str, str, LinkScope]] = []
-    for key, subset in _CARD_DATASETS.get(card_id, []):
-        window = windows.get(_DATASETS[key]["feed"])
-        if not window:
-            continue
-        where = _scan_where(key, coord, radius_miles=radius_miles, start=window[0], end=window[1], subset=subset)
-        if where:
-            url = _explore_url(key, _select_soql(key, where=where, limit=_BROWSE_LIMIT))
-            out.append((dataset_label(key), url, key, "scan"))
-            continue
-        records = dossier_records_url(key, (dossier_ids or {}).get(key, []))
-        if records:
-            out.append((dataset_label(key), records, key, "records"))
+) -> list[tuple[str, str, str]]:
+    windows = {
+        "crime": crime_days,
+        "311": reports_311_days,
+        "permits": permit_days,
+        "evictions": eviction_days,
+    }
+    ids_by_key = dossier_ids or {}
+    out: list[tuple[str, str, str]] = []
+    for key in _CARD_DATASET_KEYS.get(card_id, []):
+        days = windows.get(key)
+        ids = ids_by_key.get(key, [])
+        url = radius_browse_url(
+            key,
+            coord,
+            radius_miles=radius_miles,
+            days_back=days,
+            formatted_address=formatted_address,
+            source_ids=ids or None,
+        )
+        out.append((dataset_label(key), url, key))
     return out
 
 
-def adsb_aircraft_url(icao24: str) -> str | None:
-    """adsb.lol map focused on one aircraft (the ADS-B source ZerMap collects from)."""
+def opensky_track_url(icao24: str, observed_at: str = "") -> str | None:
     icao = (icao24 or "").strip().lower()
-    if not re.fullmatch(r"[a-f0-9]{6}", icao):
+    if not icao:
         return None
-    return f"https://adsb.lol/?icao={icao}"
+    return f"https://opensky-network.org/aircraft-profile?icao24={quote(icao)}"
 
 
-def adsb_area_url(coord: Coordinate) -> str:
-    """adsb.lol live map centered on the scanned address."""
-    return f"https://adsb.lol/?lat={coord.lat:.5f}&lon={coord.lng:.5f}&zoom=13"
+def opensky_area_url(coord: Coordinate, *, radius_miles: float) -> str:
+    """OpenSky Network explorer centered on the scan area."""
+    lat_delta = radius_miles / 69.0
+    lng_delta = radius_miles / (69.0 * max(0.2, math.cos(math.radians(coord.lat))))
+    lamin = coord.lat - lat_delta
+    lamax = coord.lat + lat_delta
+    lomin = coord.lng - lng_delta
+    lomax = coord.lng + lng_delta
+    return (
+        "https://opensky-network.org/network/explorer/"
+        f"lamin/{lamin:.6f}/lomin/{lomin:.6f}/lamax/{lamax:.6f}/lomax/{lomax:.6f}"
+    )
 
 
-def adsb_aircraft_from_label(label: str) -> str | None:
+def opensky_track_from_label(label: str) -> str | None:
     match = _ICAO_FROM_LABEL_RE.search(label or "")
-    return adsb_aircraft_url(match.group(1)) if match else None
-
-
-def hpd_violations_url(formatted_address: str = "") -> str | None:
-    """
-    HPD housing violations on NYC Open Data filtered to the subject building. None without a
-    house number and street (a place like "Union Square" is not one building).
-    """
-    parts = parse_address_parts(formatted_address)
-    token = parts.get("street_token")
-    if not parts.get("housenumber") or not token:
+    if not match:
         return None
-    clauses = [
-        f"housenumber='{_soql_escape(str(parts['housenumber']))}'",
-        f"upper(streetname) like '%{_soql_escape(str(token).upper())}%'",
-    ]
+    return opensky_track_url(match.group(1))
+
+
+def hpd_violations_url(formatted_address: str = "") -> str:
+    """HPD housing violations on NYC Open Data filtered to the subject address."""
+    parts = parse_address_parts(formatted_address)
+    clauses: list[str] = []
+    if parts.get("housenumber"):
+        clauses.append(f"housenumber='{_soql_escape(str(parts['housenumber']))}'")
+    token = parts.get("street_token")
+    if token:
+        clauses.append(f"upper(streetname) like '%{_soql_escape(str(token).upper())}%'")
     borough = parts.get("borough")
     if borough:
         clauses.append(f"upper(boro)='{_soql_escape(str(borough).upper())}'")
+    if not clauses:
+        return "https://hpdonline.nyc.gov/hpdonline/"
     where = " AND ".join(clauses)
     soql = (
         f"SELECT {_HPD_VIOLATIONS['select']} WHERE {where} "
@@ -372,6 +488,8 @@ def dining_listing_url(card: dict, formatted_address: str = "") -> str | None:
             f"find_desc={quote(name)}&find_loc={quote(loc)}"
         )
     query = f"{name} near {formatted_address}" if formatted_address else name
+    if lat is not None and lng is not None:
+        return f"https://www.google.com/maps/search/?api=1&query={quote(query)}"
     return f"https://www.google.com/maps/search/?api=1&query={quote(query)}"
 
 

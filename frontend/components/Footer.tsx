@@ -1,92 +1,43 @@
 import Link from "next/link";
-import HomeLink from "@/components/HomeLink";
-import { LogoMark, Wordmark } from "@/components/Logo";
-import { CONTACT_EMAIL } from "@/lib/site";
-
-const linkClass = "text-ink-muted transition-colors hover:text-white";
-const headClass = "text-sm font-semibold text-white";
 
 export default function Footer() {
   const year = new Date().getFullYear();
 
   return (
-    <footer className="on-ink grain-ink relative z-20 mt-auto w-full bg-ink text-white">
-      <div aria-hidden className="checker" />
-      <div className="wrap grid gap-10 py-14 md:grid-cols-[minmax(0,1.6fr)_repeat(3,minmax(0,1fr))]">
-        <div className="max-w-sm">
-          <HomeLink className="inline-flex items-center gap-2.5 rounded" aria-label="ZerMap home">
-            <LogoMark className="h-8 w-8" />
-            <Wordmark className="text-[26px] text-white" />
-          </HomeLink>
-          <p className="mt-4 text-[15px] leading-relaxed text-ink-muted">
-            Official NYC data about the block, before you sign a lease.
+    <footer className="w-full bg-slate-950 border-t border-slate-900 py-4 mt-auto z-20">
+      <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+        <div className="flex-1">
+          <div className="font-black text-base text-white tracking-tight flex items-center gap-1 mb-1">
+            Zer<span className="text-rose-500">Map</span>
+          </div>
+          <p className="text-slate-500 text-[10px] leading-snug max-w-xs">
+            Asymmetric data leverage for renters. Uncovering the truth Big Real Estate wants hidden.
           </p>
         </div>
-
-        <nav aria-label="Product" className="text-[15px]">
-          <p className={headClass}>Product</p>
-          <ul className="mt-3 space-y-2.5">
-            <li>
-              <HomeLink className={linkClass}>Check an address</HomeLink>
-            </li>
-            <li>
-              <Link href="/about" className={linkClass}>
-                About
-              </Link>
-            </li>
-            {CONTACT_EMAIL ? (
-              <li>
-                <a href={`mailto:${CONTACT_EMAIL}`} className={linkClass}>
-                  Contact
-                </a>
-              </li>
-            ) : null}
-          </ul>
-        </nav>
-
-        <nav aria-label="Data" className="text-[15px]">
-          <p className={headClass}>Data</p>
-          <ul className="mt-3 space-y-2.5">
-            <li>
-              <a href="https://opendata.cityofnewyork.us/" target="_blank" rel="noopener noreferrer" className={linkClass}>
-                NYC Open Data
-              </a>
-            </li>
-            <li>
-              <Link href="/about#data" className={linkClass}>
-                Data sources
-              </Link>
-            </li>
-          </ul>
-        </nav>
-
-        <nav aria-label="Legal" className="text-[15px]">
-          <p className={headClass}>Legal</p>
-          <ul className="mt-3 space-y-2.5">
-            <li>
-              <Link href="/privacy" className={linkClass}>
-                Privacy
-              </Link>
-            </li>
-            <li>
-              <Link href="/terms" className={linkClass}>
-                Terms
-              </Link>
-            </li>
-          </ul>
-        </nav>
-      </div>
-
-      <div aria-hidden className="wrap select-none">
-        <div className="footer-sign-box">
-          <p className="footer-sign display-xl text-ink-2">ZerMap</p>
+        <div className="flex flex-wrap gap-8 text-[11px] font-medium text-slate-400">
+          <div className="flex flex-col gap-1">
+            <span className="text-white font-bold uppercase text-[9px] tracking-widest mb-0.5">Product</span>
+            <Link href="/" className="hover:text-rose-400 transition-colors">Scanner</Link>
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-white font-bold uppercase text-[9px] tracking-widest mb-0.5">Data</span>
+            <a
+              href="https://opendata.cityofnewyork.us/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-rose-400 transition-colors"
+            >
+              NYC Open Data
+            </a>
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-white font-bold uppercase text-[9px] tracking-widest mb-0.5">Legal</span>
+            <span className="text-slate-500">Privacy (soon)</span>
+          </div>
         </div>
-      </div>
-
-      <div className="border-t border-ink-line">
-        <p className="wrap py-5 text-sm text-ink-muted">
-          &copy; {year} ZerMap. Independent; not affiliated with the City of New York.
-        </p>
+        <div className="flex flex-col items-start md:items-end gap-2 text-[10px] text-slate-600">
+          <p>&copy; {year} ZerMap. Not affiliated with Zillow.</p>
+        </div>
       </div>
     </footer>
   );

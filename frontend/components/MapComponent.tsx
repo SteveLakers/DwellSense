@@ -2,10 +2,16 @@
 
 import { useEffect, useRef, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
-import { DataSource, FlightExposure, MapData, LogisticsCard } from "@/lib/types";
+import { FlightExposure, MapData, LogisticsCard } from "@/lib/types";
 import { flightPathToLineLngLat, flightPathToRouteLatLng, filterFlightPathsWithinRadius } from "@/lib/flightPathDisplay";
-import { escapeHtml, formatCount, formatDistance, plural } from "@/lib/format";
-import { reviewCountLabel } from "@/lib/proximityCards";
+import {
+  flightAltitudeNote,
+  flightElevationBadge,
+  flightElevationBadgeClasses,
+  flightFrequencyLabel,
+  flightNoiseSummary,
+  formatObservationWindow,
+} from "@/lib/flightExposureDisplay";
 
 mapboxgl.accessToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN || "";
 
@@ -34,22 +40,19 @@ const SWARM_EMOJI: Record<string, string> = {
 };
 
 const SWARM_COLOR: Record<string, string> = {
-  police:       "#1D4ED8",
-  rat:          "#7E22CE",
-  permit:       "#C2410C",
-  construction: "#C2410C",
-  truck:        "#A16207",
-  bus:          "#4D7C0F",
-  noise:        "#A16207",
-  fire:         "#B91C1C",
-  water:        "#0369A1",
-  trash:        "#15803D",
-  graffiti:     "#A21CAF",
-  report:       "#57534E",
+  police:       "#60a5fa",
+  rat:          "#c084fc",
+  permit:       "#fb923c",
+  construction: "#fb923c",
+  truck:        "#facc15",
+  bus:          "#d9f99d",
+  noise:        "#fde047",
+  fire:         "#f97316",
+  water:        "#38bdf8",
+  trash:        "#86efac",
+  graffiti:     "#f0abfc",
+  report:       "#94a3b8",
 };
-
-const INK = "#151515";
-const TAXI = "#FFCC00";
 
 const LOGISTICS_PIN_EMOJI: Record<string, string> = {
   subway: "🚇",
@@ -80,64 +83,15 @@ function logisticsPinEmoji(card: LogisticsCard): string {
 function zoneKindLabel(color: string): string {
   switch (color) {
     case "#ef4444":
-      return "NYPD complaint";
+      return "NYPD crime report zone";
     case "#a855f7":
-      return "311 rodent complaint";
+      return "311 rodent activity zone";
     case "#f97316":
-      return "DOB permit";
+      return "DOB permit zone";
     case "#3b82f6":
     default:
-      return "311 request";
+      return "311 complaint zone";
   }
-}
-
-/** Legend rows for pin types present on the map (types from backend city_data.build_swarm). */
-const SWARM_LEGEND: { emoji: string; types: string[]; label: (present: Set<string>) => string }[] = [
-  { emoji: "🚓", types: ["police"], label: () => "NYPD complaints" },
-  {
-    emoji: "🚧",
-    types: ["permit", "construction"],
-    label: (p) =>
-      p.has("permit") && p.has("construction")
-        ? "DOB permits & 311 construction"
-        : p.has("permit")
-          ? "DOB permits"
-          : "311 construction",
-  },
-  { emoji: "🐀", types: ["rat"], label: () => "Rodents (311)" },
-  { emoji: "🔊", types: ["noise"], label: () => "Noise (311)" },
-  { emoji: "🔥", types: ["fire"], label: () => "Heat & hot water (311)" },
-  { emoji: "💧", types: ["water"], label: () => "Water & sewer (311)" },
-  { emoji: "🗑️", types: ["trash"], label: () => "Sanitation (311)" },
-  { emoji: "🎨", types: ["graffiti"], label: () => "Graffiti (311)" },
-  { emoji: "🚛", types: ["truck"], label: () => "Traffic (311)" },
-  { emoji: "📋", types: ["report"], label: () => "Other 311" },
-];
-
-/** Colours reach popup HTML from the backend, so only plain hex values are let through. */
-function safeColor(color: string): string {
-  return /^#[0-9a-f]{3,8}$/i.test(color.trim()) ? color.trim() : "#63625B";
-}
-
-function popupHtml(title: string, color: string, lines: (string | null | undefined)[]): string {
-  const body = lines
-    .filter((l): l is string => Boolean(l))
-    .map((l) => `<div style="font-size:13px;line-height:1.35;color:#45453f;margin-top:4px">${escapeHtml(l)}</div>`)
-    .join("");
-  return (
-    `<div style="display:flex;align-items:center;gap:7px;font-size:14px;font-weight:700;line-height:1.25;color:${INK}">` +
-    `<span style="flex:none;width:10px;height:10px;border-radius:2px;background:${safeColor(color)}"></span>` +
-    `${escapeHtml(title)}</div>${body}`
-  );
-}
-
-/** Sources whose records become map pins (backend city_data.build_swarm). */
-const PIN_SOURCE_KEYS = ["crime", "311", "permits"];
-
-/** "A", "A and B", "A, B and C" */
-function joinLabels(labels: string[]): string {
-  if (labels.length <= 1) return labels.join("");
-  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
 }
 
 interface Props {
@@ -145,15 +99,13 @@ interface Props {
   logistics: LogisticsCard[];
   activeRoute: string | null;
   flightExposure?: FlightExposure | null;
-  /** Lets the caption say when a source that feeds the pins did not answer. */
-  dataSources?: DataSource[];
 }
 
-export default function MapComponent({ mapData, logistics, activeRoute, flightExposure, dataSources }: Props) {
+export default function MapComponent({ mapData, logistics, activeRoute, flightExposure }: Props) {
   const scanRadiusMi = mapData.scan_radius_miles ?? 2;
   const scanRadiusLabel = Number.isInteger(scanRadiusMi)
-    ? `${scanRadiusMi} mi`
-    : `${scanRadiusMi.toFixed(1)} mi`;
+    ? `${scanRadiusMi}-mi`
+    : `${scanRadiusMi.toFixed(1)}-mi`;
   const showFlightFeature = Boolean(flightExposure?.show_flight_feature);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -173,7 +125,7 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
 
     const map = new mapboxgl.Map({
       container: containerRef.current,
-      style: "mapbox://styles/mapbox/light-v11",
+      style: "mapbox://styles/mapbox/dark-v11",
       center: [mapData.target.lng, mapData.target.lat],
       zoom: 14,
       scrollZoom: true,
@@ -202,13 +154,13 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
         id: "route-glow",
         type: "line",
         source: "route",
-        paint: { "line-color": INK, "line-width": 10, "line-opacity": 0.15 },
+        paint: { "line-color": "#ffffff", "line-width": 10, "line-opacity": 0.15 },
       });
       map.addLayer({
         id: "route-line",
         type: "line",
         source: "route",
-        paint: { "line-color": INK, "line-width": 3, "line-dasharray": [2, 2] },
+        paint: { "line-color": "#ffffff", "line-width": 3, "line-dasharray": [2, 2] },
       });
     });
 
@@ -245,8 +197,8 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
       source.setData({ type: "FeatureCollection", features: [] });
       map.flyTo({ center: [mapData.target.lng, mapData.target.lat], zoom: 14, duration: 800 });
       // Reset route line colors
-      map.setPaintProperty("route-glow", "line-color", INK);
-      map.setPaintProperty("route-line", "line-color", INK);
+      map.setPaintProperty("route-glow", "line-color", "#ffffff");
+      map.setPaintProperty("route-line", "line-color", "#ffffff");
       return;
     }
 
@@ -384,7 +336,7 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
             label: zone.label,
             color: zone.color,
             radius_meters: zone.radius_meters,
-            detail: zone.detail ?? zoneKindLabel(zone.color),
+            kind: zoneKindLabel(zone.color),
           },
           geometry: {
             type: "Point" as const,
@@ -464,10 +416,17 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
       map.setFeatureState({ source: sourceId, id }, { hover: true });
       map.getCanvas().style.cursor = "pointer";
 
-      const label = String(feature.properties?.label ?? "Municipal record");
+      const label = String(feature.properties?.label ?? "Municipal activity");
       const color = String(feature.properties?.color ?? "#3b82f6");
-      const detail = String(feature.properties?.detail ?? "");
-      popup.setLngLat(e.lngLat).setHTML(popupHtml(label, color, [detail])).addTo(map);
+      const kind = String(feature.properties?.kind ?? "Activity zone");
+      popup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div style="font-size:11px;font-weight:700;color:${color};margin-bottom:2px">${label}</div>` +
+            `<div style="font-size:10px;color:#94a3b8">${kind}</div>` +
+            `<div style="font-size:10px;color:#64748b;margin-top:2px">Reported in last 30–90 days</div>`
+        )
+        .addTo(map);
     });
 
     map.on("mousemove", layerId, (e) => {
@@ -481,7 +440,7 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
 
   const addSwarm = (map: mapboxgl.Map) => {
     mapData.swarm.forEach((pin) => {
-      const color = SWARM_COLOR[pin.type] || "#57534E";
+      const color = SWARM_COLOR[pin.type] || "#94a3b8";
       // Outer node: Mapbox sets transform on this element for map position — never set transform here.
       const outer = document.createElement("div");
       outer.style.cssText = `
@@ -492,9 +451,9 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
       inner.style.cssText = `
         font-size: 12px; display: flex; align-items: center; justify-content: center;
         width: 100%; height: 100%;
-        background: #ffffff; border: 1.5px solid ${color};
-        border-radius: 50%; box-shadow: 0 1px 2px rgba(21,21,21,0.3);
-        transition: transform 0.15s;
+        background: rgba(15,23,42,0.92); border: 1px solid ${color};
+        border-radius: 50%; backdrop-filter: blur(2px);
+        transition: transform 0.15s, box-shadow 0.15s;
         transform-origin: center center;
       `;
       inner.textContent = SWARM_EMOJI[pin.type] || "📋";
@@ -506,7 +465,10 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
         closeButton: false,
         closeOnClick: false,
         anchor: "bottom",
-      }).setHTML(popupHtml(pin.label, color, [pin.detail]));
+      }).setHTML(
+        `<div style="font-size:11px;font-weight:700;color:${color};margin-bottom:2px">${pin.label}</div>` +
+        `<div style="font-size:10px;color:#94a3b8">Reported in last 30 days</div>`
+      );
 
       outer.addEventListener("mouseenter", () => {
         inner.style.transform = "scale(1.4)";
@@ -536,11 +498,12 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
       `;
       const inner = document.createElement("div");
       inner.style.cssText = `
-        font-size: 19px; display: flex; align-items: center; justify-content: center;
+        font-size: 20px; display: flex; align-items: center; justify-content: center;
         width: 100%; height: 100%;
-        background: #ffffff; border: 2.5px solid ${safeColor(card.color)};
-        border-radius: 50%; box-shadow: 0 2px 4px rgba(21,21,21,0.3);
-        transition: transform 0.2s;
+        background: rgba(30,41,59,0.9); border: 2px solid ${card.color};
+        border-radius: 50%; backdrop-filter: blur(2px);
+        box-shadow: 0 0 12px ${card.color}66;
+        transition: transform 0.2s, box-shadow 0.2s;
         transform-origin: center center;
       `;
       inner.textContent = pinEmoji;
@@ -548,8 +511,9 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
 
       const ratingLine =
         card.type.startsWith("dining-") && card.rating != null
-          ? `★ ${card.rating.toFixed(1)}${card.review_count != null ? ` (${reviewCountLabel(card) ?? ""})` : ""}`
-          : null;
+          ? `<div style="font-size:10px;color:#fbbf24;margin-top:2px">★ ${card.rating.toFixed(1)}` +
+            `${card.review_count != null ? ` · ${card.review_count} reviews` : ""}</div>`
+          : "";
 
       const popup = new mapboxgl.Popup({
         offset: 20,
@@ -557,10 +521,9 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
         closeOnClick: false,
         anchor: "bottom",
       }).setHTML(
-        popupHtml(card.name, card.color, [
-          `${card.category}, ${formatDistance(card.distance_value, card.distance_unit)} away`,
-          ratingLine,
-        ])
+        `<div style="font-weight:700;color:${card.color};font-size:12px">${card.emoji} ${card.name}</div>` +
+        `<div style="font-size:10px;color:#94a3b8;margin-top:2px">${card.category} · ${card.distance_value} ${card.distance_unit} away</div>` +
+        ratingLine
       );
 
       outer.addEventListener("mouseenter", () => {
@@ -580,23 +543,14 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
   };
 
   const addTargetPin = (map: mapboxgl.Map) => {
-    // Outer node is positioned by Mapbox (transform); the pulse animates an inner node only.
     const el = document.createElement("div");
-    el.style.cssText = "width: 30px; height: 30px; cursor: pointer; z-index: 2;";
-    const pulse = document.createElement("span");
-    pulse.className = "pin-pulse";
-    pulse.style.cssText =
-      `position: absolute; left: 5px; top: 5px; width: 20px; height: 20px; border-radius: 9999px; background: ${TAXI};`;
-    const dot = document.createElement("span");
-    dot.style.cssText =
-      `position: absolute; left: 5px; top: 5px; width: 20px; height: 20px; border-radius: 9999px; background: ${INK};` +
-      ` border: 4px solid ${TAXI}; box-shadow: 0 0 0 2px ${INK}, 0 4px 10px rgba(21,21,21,0.4);`;
-    el.append(pulse, dot);
+    el.style.cssText = "font-size: 36px; cursor: pointer; filter: drop-shadow(0 0 8px rgba(244,63,94,0.8)); line-height: 1;";
+    el.textContent = "📍";
 
-    const popup = new mapboxgl.Popup({ offset: 18, closeButton: false })
-      .setHTML(popupHtml("This address", TAXI, [`${mapData.target.lat.toFixed(5)}, ${mapData.target.lng.toFixed(5)}`]));
+    const popup = new mapboxgl.Popup({ offset: 36, closeButton: false })
+      .setHTML(`<b style="color:#f43f5e">Target Property</b><br><span style="font-size:10px;color:#94a3b8;">${mapData.target.lat.toFixed(5)}, ${mapData.target.lng.toFixed(5)}</span>`);
 
-    const marker = new mapboxgl.Marker({ element: el, anchor: "center" })
+    const marker = new mapboxgl.Marker({ element: el, anchor: "bottom" })
       .setLngLat([mapData.target.lng, mapData.target.lat])
       .setPopup(popup)
       .addTo(map);
@@ -618,7 +572,8 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
         const inner = document.createElement("div");
         inner.style.cssText = `
           width: 6px; height: 6px; border-radius: 50%;
-          background: #22d3ee; border: 1px solid #0e7490;
+          background: #22d3ee; border: 1px solid rgba(255,255,255,0.9);
+          box-shadow: 0 0 6px rgba(34,211,238,0.85);
         `;
         outer.appendChild(inner);
 
@@ -670,7 +625,7 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
       paint: {
         "line-color": "#22d3ee",
         "line-width": 11,
-        "line-opacity": 0.3,
+        "line-opacity": 0.2,
         "line-blur": 2.5,
         ...dashPaint,
       },
@@ -731,14 +686,12 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
     trackPlaneMarkersRef.current = routeMetrics.map(({ route }) => {
       const el = document.createElement("div");
       el.style.cssText =
-        "font-size: 18px; line-height: 1; filter: drop-shadow(0 1px 2px rgba(21,21,21,0.45));";
+        "font-size: 18px; line-height: 1; filter: drop-shadow(0 0 6px rgba(6,182,212,0.7));";
       el.textContent = "✈️";
       return new mapboxgl.Marker({ element: el, anchor: "center" })
         .setLngLat([route[0].lng, route[0].lat])
         .addTo(map);
     });
-
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
 
     const step = (time: number) => {
       if (!trackLastTimeRef.current) trackLastTimeRef.current = time;
@@ -778,78 +731,131 @@ export default function MapComponent({ mapData, logistics, activeRoute, flightEx
     trackRafRef.current = requestAnimationFrame(step);
   }, []);
 
-  const shown = mapData.swarm.length;
-  const total = mapData.swarm_location_total ?? shown;
-  const totalText = `${formatCount(total)}${mapData.swarm_total_is_lower_bound ? "+" : ""}`;
-  const locationsNote =
-    total > shown || mapData.swarm_total_is_lower_bound
-      ? `Showing ${formatCount(shown)} of ${totalText} real NYC locations within ${scanRadiusLabel}`
-      : `${formatCount(shown)} real NYC ${plural(shown, "location")} within ${scanRadiusLabel}`;
-  // A source that did not answer has no pins: say so, so an empty or thin map is not read as "no records".
-  const missingPinSources = (dataSources ?? [])
-    .filter((s) => PIN_SOURCE_KEYS.includes(s.key) && s.status === "unavailable")
-    .map((s) => s.label);
-  const presentTypes = new Set<string>(mapData.swarm.map((p) => p.type));
-  const legend = SWARM_LEGEND.filter((row) => row.types.some((t) => presentTypes.has(t)));
-
-  const flightPaths = getFlightPaths();
-
   return (
-    <section aria-labelledby="map-heading" className="flex min-w-0 flex-col">
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between sm:gap-6">
-        <div className="min-w-0">
-          <h2 id="map-heading" className="heading text-[1.875rem] sm:text-[2.125rem]">
-            Map of real records
-          </h2>
-          <p className="mt-1 text-[15px] text-fg-2">{locationsNote}</p>
-          {missingPinSources.length > 0 && (
-            <p className="mt-1 text-[15px] font-semibold text-fg">
-              No pins for {joinLabels(missingPinSources)}: unavailable during this scan.
+    <div className="w-full bg-slate-800 rounded-3xl border border-slate-700 shadow-2xl px-1 pt-2 pb-2 md:px-2 md:pt-2.5 md:pb-2.5 fade-in" style={{ animationDelay: "0.2s" }}>
+      <div className="flex justify-between items-center mb-2 px-1">
+        <h3 className="text-white font-black uppercase tracking-widest text-base md:text-lg flex items-center gap-2.5">
+          <span className="text-xl md:text-2xl leading-none" aria-hidden>
+            🗺️
+          </span>
+          Live Threat Density Map{" "}
+          <span className="text-rose-500 animate-pulse text-base md:text-lg">● Live Swarm</span>
+        </h3>
+        <span className="text-slate-400 text-[10px] font-bold bg-slate-900 px-3 py-1 rounded-full border border-slate-700 italic hidden md:block">
+          {mapData.swarm_location_total != null && mapData.swarm_location_total > mapData.swarm.length
+            ? `Showing ${mapData.swarm.length} of ${mapData.swarm_location_total} real NYC locations (${scanRadiusLabel}) · `
+            : `${mapData.swarm.length} real NYC locations (${scanRadiusLabel}) · `}
+          Scroll to zoom · Hover pins for details
+        </span>
+      </div>
+
+      <div
+        className={[
+          "overflow-hidden",
+          showFlightFeature && flightExposure
+            ? "rounded-2xl border border-slate-800"
+            : "",
+        ].join(" ")}
+      >
+        <div
+          ref={containerRef}
+          className={[
+            "w-full h-[520px] md:h-[720px] overflow-hidden",
+            showFlightFeature && flightExposure
+              ? "border-0"
+              : "rounded-2xl border border-slate-800",
+          ].join(" ")}
+        />
+
+        {showFlightFeature && flightExposure && (
+          <div className="border-t border-cyan-900/40 bg-slate-900/70 p-3 md:p-4">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <h4 className="inline-flex items-center gap-1.5 rounded-lg bg-white/20 border border-white/25 px-2.5 py-1 text-white font-black text-sm md:text-base leading-tight">
+              ✈️ Flight noise
+            </h4>
+            <span
+              className={[
+                "px-2 py-0.5 rounded-full border text-[11px] md:text-xs font-bold shrink-0",
+                flightElevationBadgeClasses(flightExposure),
+              ].join(" ")}
+              title="Compared to typical plane traffic within ~2 mi across NYC"
+            >
+              {flightElevationBadge(flightExposure)}
+            </span>
+          </div>
+
+          <p className="mt-2.5 text-lg md:text-xl text-white font-bold leading-snug max-w-2xl">
+            {flightNoiseSummary(flightExposure)}
+          </p>
+
+          {flightExposure.data_quality !== "unavailable" && (
+            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div className="rounded-lg bg-slate-800/90 border border-slate-700 px-3 py-2.5">
+                <div className="text-[11px] md:text-xs font-black uppercase tracking-widest text-slate-400">
+                  Overnight · 10 PM–7 AM
+                </div>
+                <div className="mt-1 text-lg md:text-xl font-black text-white leading-tight">
+                  {flightFrequencyLabel(flightExposure.night_overflights_per_hour)}
+                </div>
+                <div className="mt-0.5 text-base md:text-lg text-white font-semibold leading-snug">
+                  {flightExposure.night_overflights_per_hour < 0.2
+                    ? "Usually quiet at night"
+                    : `Roughly ${flightExposure.night_overflights_per_hour.toFixed(1)} passes per hour`}
+                </div>
+              </div>
+              <div className="rounded-lg bg-slate-800/90 border border-slate-700 px-3 py-2.5">
+                <div className="text-[11px] md:text-xs font-black uppercase tracking-widest text-slate-400">
+                  Daytime · 7 AM–10 PM
+                </div>
+                <div className="mt-1 text-lg md:text-xl font-black text-white leading-tight">
+                  {flightFrequencyLabel(flightExposure.day_overflights_per_hour)}
+                </div>
+                <div className="mt-0.5 text-base md:text-lg text-white font-semibold leading-snug">
+                  {flightExposure.day_overflights_per_hour < 0.2
+                    ? "Light daytime traffic"
+                    : `Roughly ${flightExposure.day_overflights_per_hour.toFixed(1)} passes per hour`}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {flightAltitudeNote(flightExposure) && (
+            <p className="mt-2.5 text-base md:text-lg text-amber-200 font-semibold leading-snug max-w-2xl">
+              {flightAltitudeNote(flightExposure)}
             </p>
           )}
-        </div>
-        <p className="hidden shrink-0 pb-0.5 text-sm text-fg-3 md:block">Scroll to zoom. Hover a pin for details.</p>
-      </div>
 
-      <div className="mt-4 overflow-hidden rounded-lg border-2 border-fg bg-surface-2">
-        <div ref={containerRef} className="h-[380px] w-full sm:h-[460px] lg:h-[600px]" />
-      </div>
-
-      <div className="mt-4">
-        <ul className="flex flex-wrap gap-x-5 gap-y-2 text-sm text-fg-2" aria-label="Map legend">
-          <li className="flex items-center gap-1.5">
-            <span aria-hidden className="h-3.5 w-3.5 rounded-full border-[3px] border-brand bg-fg ring-1 ring-fg" /> This
-            address
-          </li>
-          {legend.map((row) => (
-            <li key={row.emoji} className="flex items-center gap-1.5">
-              <span aria-hidden>{row.emoji}</span> {row.label(presentTypes)}
-            </li>
-          ))}
-          <li className="flex items-center gap-1.5">
-            <span aria-hidden>🚇</span> Transit
-          </li>
-          <li className="flex items-center gap-1.5">
-            <span aria-hidden>✈️</span> Airport
-          </li>
-          {mapData.zones.length > 0 && (
-            <li className="flex items-center gap-1.5">
-              <span aria-hidden className="h-3.5 w-3.5 rounded-full border-2 border-fg-3 bg-fg-3/20" /> Shaded circles:
-              newest records
-            </li>
-          )}
-          {showFlightFeature && flightPaths.length > 0 && (
-            <li className="flex items-center gap-1.5">
-              <span aria-hidden className="inline-block h-1 w-6 rounded-full bg-cyan-400" /> Recent flight track
-            </li>
-          )}
-        </ul>
-        {showFlightFeature && flightPaths.some((p) => (p.path?.length ?? 0) >= MIN_FLIGHT_PATH_POINTS) && (
-          <p className="mt-2 text-sm text-fg-3">
-            Cyan lines are recent real flight tracks near this address, not every flight.
+          <p className="mt-2 text-[11px] md:text-xs text-slate-400 font-semibold">
+            {formatObservationWindow(flightExposure)}
           </p>
+        </div>
         )}
       </div>
-    </section>
+
+      <div className="flex flex-wrap justify-center sm:justify-start gap-x-4 gap-y-2 mt-2 px-1 text-[10px] md:text-[11px] font-bold text-slate-300">
+        <span className="flex items-center gap-1"><span className="text-rose-500 text-lg">📍</span> Property</span>
+        <span className="flex items-center gap-1">🚓 Crime</span>
+        <span className="flex items-center gap-1">🐀 Rodents</span>
+        <span className="flex items-center gap-1">🔊 Noise</span>
+        <span className="flex items-center gap-1">🔥 Heat/Gas</span>
+        <span className="flex items-center gap-1">💧 Water</span>
+        <span className="flex items-center gap-1">🗑️ Sanitation</span>
+        <span className="flex items-center gap-1">🎨 Graffiti</span>
+        <span className="flex items-center gap-1">🚧 Permits</span>
+        <span className="flex items-center gap-1 text-emerald-400">🚇 Transit</span>
+        <span className="flex items-center gap-1 text-amber-400">✈️ Airport</span>
+        {showFlightFeature && getFlightPaths().length > 0 && (
+          <span className="flex items-center gap-1">
+            <span className="w-6 h-1 bg-cyan-500 border-y border-dashed border-cyan-200 inline-block" /> Flight Route
+          </span>
+        )}
+      </div>
+
+      {showFlightFeature && getFlightPaths().some((p) => (p.path?.length ?? 0) >= MIN_FLIGHT_PATH_POINTS) && (
+        <div className="mt-1 px-1 pb-0.5 text-[10px] md:text-[11px] font-bold text-slate-500">
+          Cyan lines show recent plane routes near this address.
+        </div>
+      )}
+    </div>
   );
 }

@@ -23,7 +23,3 @@ graphify-out/
 
 # Clerk keyless temp (local only)
 frontend/.clerk/
-
-# Claude Code personal files (local only)
-CLAUDE.local.md
-.claude/settings.local.json

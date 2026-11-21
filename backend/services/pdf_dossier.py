@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import datetime
 
 from fpdf import FPDF
 
 from models.schemas import Coordinate
-from services import city_data, flight_exposure, source_links
+from services.city_data import (
+    CRIME_DAYS_BACK,
+    EVICTION_DAYS_BACK,
+    PERMIT_DAYS_BACK,
+    REPORTS_311_DAYS_BACK,
+)
 from services.dossier_context import DossierContext
-from services.threat_card_layout import label_band_rows
+from services import source_links
 
 PDF_311_MAX = 200
 PDF_CARD_RECORDS_MAX = 50
@@ -23,31 +28,24 @@ RISK_COLORS = {
     "LOW": (30, 100, 60),
 }
 
-SEVERITY_LABELS = {
-    "quiet": "Lower than most of NYC",
-    "watch": "About typical for NYC",
-    "elevated": "Higher than most of NYC",
-    "unavailable": "Unavailable",
-    "not_checked": "Not checked",
-    "tip": "Tip",
-}
+WELLNESS_BANDS = [
+    ("91-100", "Outstanding"),
+    ("81-90", "Excellent"),
+    ("69-80", "Great"),
+    ("56-68", "Very Good"),
+    ("43-55", "Good"),
+    ("29-42", "Average"),
+    ("16-28", "Bad"),
+    ("0-15", "Terrible"),
+]
 
-_DRIVER_NAMES = {
-    "area_safety": "NYPD complaints",
-    "311": "311 requests",
-    "permits": "Active construction permits",
-    "evictions": "Residential evictions",
-    "noise": "Noise complaints",
-}
-
-# Feeds behind each card (a card is unavailable when any of these didn't answer).
-_CARD_FEEDS: dict[str, tuple[str, ...]] = {
-    "high_churn": ("evictions",),
-    "police_calls": ("police_calls",),
-    "area_safety": ("crime",),
-    "demolitions": ("permits", "311"),
-    "noise_schedule": ("311",),
-    "reports_311": ("311",),
+_CARD_DATASET_KEY: dict[str, str] = {
+    "high_churn": "evictions",
+    "police_calls": "crime",
+    "area_safety": "crime",
+    "demolitions": "permits",
+    "noise_schedule": "311",
+    "reports_311": "311",
 }
 
 _EMOJI_RE = re.compile(
@@ -121,54 +119,34 @@ def _parse_hex_color(hex_color: str) -> tuple[int, int, int]:
     return 120, 120, 120
 
 
+def _311_blob(row: dict) -> str:
+    ctype = str(row.get("complaint_type") or "")
+    desc = str(row.get("descriptor") or "")
+    return f"{ctype} {desc}".lower()
+
+
+def _filter_311_noise(rows: list[dict]) -> list[dict]:
+    keys = ("noise", "loud", "music", "party")
+    return [r for r in rows if any(k in _311_blob(r) for k in keys)]
+
+
+def _filter_311_construction(rows: list[dict]) -> list[dict]:
+    keys = ("construction", "building", "scaffold", "demolition", "crane")
+    return [r for r in rows if any(k in _311_blob(r) for k in keys)]
+
+
+def _freq_label(rate: float) -> str:
+    if rate < 0.2:
+        return "Rare"
+    if rate < 0.7:
+        return "Occasional"
+    if rate < 2:
+        return "Fairly common"
+    return "Frequent"
+
+
 def _coord(ctx: DossierContext) -> Coordinate:
     return Coordinate(lat=ctx.coord_lat, lng=ctx.coord_lng)
-
-
-def _iso_date(raw: object) -> date | None:
-    try:
-        return date.fromisoformat(str(raw)) if raw else None
-    except ValueError:
-        return None
-
-
-def _feed(ctx: DossierContext, key: str) -> dict:
-    return ctx.feeds.get(key) or {}
-
-
-def _feed_ok(ctx: DossierContext, key: str) -> bool:
-    return _feed(ctx, key).get("status") == "ok"
-
-
-def _feed_window_text(ctx: DossierContext, key: str) -> str:
-    f = _feed(ctx, key)
-    return city_data.format_window(_iso_date(f.get("window_start")), _iso_date(f.get("window_end")))
-
-
-def _feed_windows(ctx: DossierContext) -> dict[str, tuple[date, date]]:
-    out: dict[str, tuple[date, date]] = {}
-    for key, f in ctx.feeds.items():
-        start, end = _iso_date(f.get("window_start")), _iso_date(f.get("window_end"))
-        if f.get("status") == "ok" and start and end:
-            out[key] = (start, end)
-    return out
-
-
-def _source_line(src: dict) -> str:
-    if src.get("status") != "ok":
-        return "Unavailable during this scan"
-    parts = []
-    if src.get("count") is not None:
-        parts.append(f"{int(src['count']):,}")
-    window = city_data.format_window(_iso_date(src.get("window_start")), _iso_date(src.get("window_end")))
-    if window:
-        parts.append(window)
-    as_of = _iso_date(src.get("as_of"))
-    if as_of:
-        parts.append(f"data as of {as_of:%b} {as_of.day}, {as_of.year}")
-    if src.get("provider"):
-        parts.append(str(src["provider"]))
-    return " | ".join(parts)
 
 
 # ── Typography helpers ────────────────────────────────────────────────────────
@@ -210,10 +188,6 @@ def _hrule(pdf: FPDF, *, y: float | None = None, color: tuple[int, int, int] = _
 def _ensure_space(pdf: FPDF, needed: float) -> None:
     if pdf.get_y() + needed > _PAGE_BOTTOM:
         pdf.add_page()
-
-
-# A table heading plus the table header and its first row, so a heading never ends a page.
-_HEADING_WITH_TABLE_MM = 30
 
 
 # ── PDF document class ────────────────────────────────────────────────────────
@@ -299,9 +273,7 @@ def _render_cover(pdf: DossierPDF, address: str) -> None:
     for label, value in [
         ("Report Date", generated),
         ("Report Type", "Full raw-data disclosure"),
-        # Aircraft positions are named only when the report can use them.
-        ("Data Sources", "NYC Open Data, Yelp/Google Places"
-                         + ("" if flight_exposure.FLIGHT_NOISE_PAUSED else ", ADS-B ingest")),
+        ("Data Sources", "NYC Open Data, Yelp/Google Places, ADS-B ingest"),
     ]:
         pdf.set_x(_MARGIN_L)
         _font_sans(pdf, "B", 8)
@@ -573,161 +545,106 @@ def _institutional_table(
 def _record_dataset_key(row: dict, default_key: str) -> str:
     if row.get("permit_status") == "311 complaint":
         return "311"
-    return source_links.record_dataset_key(default_key, str(row.get("source_id") or ""))
+    return default_key
 
 
 # ── Data accessors ────────────────────────────────────────────────────────────
 
-class CardData:
-    def __init__(
-        self, title: str, rows: list[dict], columns: list[tuple[str, str, float]],
-        total: int | None, total_text: str, max_rows: int, dataset_key: str,
-    ) -> None:
-        self.title = title
-        self.rows = rows
-        self.columns = columns
-        self.total = total
-        self.total_text = total_text
-        self.max_rows = max_rows
-        self.dataset_key = dataset_key
-
-
-_DATE_KEYS = frozenset({"occurred_at", "created_at", "filing_date"})
-
-
-def _display_date(raw: object) -> str:
-    """'2026-09-29T00:00:00.000' -> 'Sep 29, 2026'; keeps the time when the record has one.
-
-    NYC Open Data timestamps are New York local time without an offset, so no conversion.
-    """
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    try:
-        dt = datetime.fromisoformat(text)
-    except ValueError:
-        return text
-    day = f"{dt:%b} {dt.day}, {dt.year}"
-    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
-        return day
-    return f"{day} {dt.hour % 12 or 12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
-
-
-def _with_location(rows: list[dict]) -> list[dict]:
-    out = []
-    for r in rows:
-        copy = dict(r)
-        lat, lng = copy.get("lat"), copy.get("lng")
-        copy["_location"] = f"{lat}, {lng}" if lat is not None and lng is not None else ""
-        out.append(copy)
-    return out
-
-
-def _within(ctx: DossierContext, key: str) -> str:
-    window = _feed_window_text(ctx, key)
-    radius = f"within {ctx.scan_radius_miles:g} mi"
-    return f"{radius}, {window}" if window else radius
-
-
-def _card_data(card_id: str, ctx: DossierContext) -> CardData | None:
+def _card_data(card_id: str, ctx: DossierContext):
     crime_cols = [
-        ("Date", "occurred_at", 0.13),
-        ("Offense", "crime_type", 0.22),
-        ("Description", "description", 0.33),
-        ("Location", "_location", 0.18),
+        ("Date", "occurred_at", 0.14),
+        ("Type", "crime_type", 0.20),
+        ("Description", "description", 0.36),
+        ("Location", "lat", 0.18),
     ]
     r311_cols = [
         ("Date", "created_at", 0.13),
         ("Complaint", "complaint_type", 0.20),
-        ("Descriptor", "descriptor", 0.37),
-        ("Location", "_location", 0.16),
+        ("Descriptor", "descriptor", 0.39),
+        ("Location", "lat", 0.16),
     ]
     permit_cols = [
-        ("Issued", "filing_date", 0.13),
+        ("Filed", "filing_date", 0.13),
         ("Type", "permit_type", 0.17),
         ("Status", "permit_status", 0.13),
         ("Details", "job_description", 0.41),
     ]
     eviction_cols = [
-        ("Executed", "filing_date", 0.16),
-        ("Address", "address", 0.40),
-        ("Location", "_location", 0.28),
+        ("Filed", "filing_date", 0.18),
+        ("Case", "case_type", 0.28),
+        ("Location", "lat", 0.38),
     ]
 
-    def _total(key: str, part: str | None = None) -> int | None:
-        f = _feed(ctx, key)
-        if f.get("status") != "ok":
-            return None
-        return int((f.get("breakdown") or {}).get(part, 0)) if part else int(f.get("total") or 0)
+    def _with_lng(rows: list[dict], lat_key: str = "lat") -> list[dict]:
+        out = []
+        for r in rows:
+            copy = dict(r)
+            lat, lng = copy.get(lat_key), copy.get("lng")
+            if lat is not None and lng is not None:
+                copy[lat_key] = f"{lat}, {lng}"
+            out.append(copy)
+        return out
 
+    dk = _CARD_DATASET_KEY.get(card_id, "")
     if card_id == "high_churn":
-        n = _total("evictions")
-        return CardData("Residential Evictions", _with_location(ctx.evictions), eviction_cols, n,
-                        f"{n or 0:,} {_within(ctx, 'evictions')}", PDF_CARD_RECORDS_MAX, "evictions")
+        return "Eviction Filings", _with_lng(ctx.evictions), eviction_cols, len(ctx.evictions), PDF_CARD_RECORDS_MAX, dk
+    if card_id == "police_calls":
+        return "NYPD Dispatch", _with_lng(ctx.crime), crime_cols, len(ctx.crime), PDF_CARD_RECORDS_MAX, dk
     if card_id == "area_safety":
-        n = _total("crime")
-        return CardData("NYPD Complaints", _with_location(ctx.crime), crime_cols, n,
-                        f"{n or 0:,} {_within(ctx, 'crime')}", PDF_CARD_RECORDS_MAX, "crime")
+        return "Crime Reports", _with_lng(ctx.crime), crime_cols, len(ctx.crime), PDF_CARD_RECORDS_MAX, dk
     if card_id == "demolitions":
-        permits_n, construction_n = _total("permits"), _total("311", "construction")
-        construction = [r for r in ctx.reports_311 if city_data.is_311_construction(r)]
+        construction = _filter_311_construction(ctx.reports_311)
         combined = list(ctx.permits) + [
             {**r, "filing_date": r.get("created_at"), "permit_type": r.get("complaint_type"),
              "permit_status": "311 complaint", "job_description": r.get("descriptor")}
             for r in construction
         ]
-        total = (permits_n or 0) + (construction_n or 0)
-        permits_text = (
-            f"{permits_n:,} active {'permit' if permits_n == 1 else 'permits'} {_within(ctx, 'permits')}"
-            if permits_n is not None else "DOB permits unavailable"
-        )
-        construction_text = (
-            f"{construction_n:,} construction {'complaint' if construction_n == 1 else 'complaints'} to 311 "
-            f"({_feed_window_text(ctx, '311')})"
-            if construction_n is not None else "311 unavailable"
-        )
-        text = f"{permits_text}; {construction_text}"
-        return CardData("Permits & Construction", combined, permit_cols, total, text, PDF_CARD_RECORDS_MAX, "permits")
+        return "Permits & Construction", combined, permit_cols, len(combined), PDF_CARD_RECORDS_MAX, dk
     if card_id == "noise_schedule":
-        n = _total("311", "noise")
-        noise = [r for r in ctx.reports_311 if city_data.is_311_noise(r)]
-        return CardData("Noise Complaints", _with_location(noise), r311_cols, n,
-                        f"{n or 0:,} {_within(ctx, '311')}", PDF_CARD_RECORDS_MAX, "311")
+        noise = _filter_311_noise(ctx.reports_311)
+        return "Noise Complaints", _with_lng(noise), r311_cols, len(noise), PDF_CARD_RECORDS_MAX, dk
     if card_id == "reports_311":
-        n = _total("311")
-        return CardData("311 Requests", _with_location(ctx.reports_311), r311_cols, n,
-                        f"{n or 0:,} {_within(ctx, '311')}", PDF_311_MAX, "311")
-    return None
+        return "311 Complaints", _with_lng(ctx.reports_311), r311_cols, len(ctx.reports_311), PDF_311_MAX, dk
+    return "", [], [], 0, 0, ""
+
+
+def _collect_source_ids(rows: list[dict]) -> list[str]:
+    return [
+        str(r.get("source_id") or "").strip()
+        for r in rows
+        if str(r.get("source_id") or "").strip()
+    ]
 
 
 def _dossier_ids_for_card(card_id: str, ctx: DossierContext) -> dict[str, list[str]]:
-    """Record IDs (in table order) for datasets linked by exact records instead of the scan filter."""
-    def _ids(rows: list[dict], prefix: str = "") -> list[str]:
-        out = []
-        for r in rows[:PDF_CARD_RECORDS_MAX]:
-            sid = str(r.get("source_id") or "").strip()
-            if sid and sid.startswith(prefix):
-                out.append(sid)
-        return out
-
     if card_id == "high_churn":
-        return {"evictions": _ids(ctx.evictions)}
+        return {"evictions": _collect_source_ids(ctx.evictions)}
+    if card_id in ("police_calls", "area_safety"):
+        return {"crime": _collect_source_ids(ctx.crime)}
+    if card_id in ("noise_schedule", "reports_311"):
+        return {"311": _collect_source_ids(ctx.reports_311)}
     if card_id == "demolitions":
-        return {"permits": _ids([r for r in ctx.permits if str(r.get("source_id") or "").startswith("BIS:")])}
+        construction = _filter_311_construction(ctx.reports_311)
+        return {
+            "permits": _collect_source_ids(ctx.permits),
+            "311": _collect_source_ids(construction),
+        }
     return {}
 
 
-def _police_calls_rows(ctx: DossierContext) -> list[dict]:
-    f = _feed(ctx, "police_calls")
-    breakdown = f.get("breakdown") or {}
-    rows = [
-        {"label": "Critical priority", "count": f"{int(breakdown.get('critical', 0)):,}"},
-        {"label": "Serious priority", "count": f"{int(breakdown.get('serious', 0)):,}"},
-        {"label": "Non-critical priority", "count": f"{int(breakdown.get('non_critical', 0)):,}"},
-    ]
-    for call_type, n in f.get("top_types") or []:
-        rows.append({"label": f"Most common: {call_type}", "count": f"{int(n):,}"})
-    return rows
+def _browse_url_for_card(card_id: str, ctx: DossierContext) -> str:
+    urls = source_links.card_dataset_urls(
+        card_id,
+        _coord(ctx),
+        radius_miles=ctx.scan_radius_miles,
+        crime_days=CRIME_DAYS_BACK,
+        reports_311_days=REPORTS_311_DAYS_BACK,
+        permit_days=PERMIT_DAYS_BACK,
+        eviction_days=EVICTION_DAYS_BACK,
+        formatted_address=ctx.formatted_address,
+        dossier_ids=_dossier_ids_for_card(card_id, ctx),
+    )
+    return urls[0][1] if urls else ""
 
 
 # ── Section renderers ─────────────────────────────────────────────────────────
@@ -747,50 +664,39 @@ def _render_overview(pdf: DossierPDF, ctx: DossierContext, client: dict) -> None
         ("Coordinates", f"{ctx.coord_lat:.5f}, {ctx.coord_lng:.5f}"),
         ("Scan Radius", f"{ctx.scan_radius_miles:g} miles"),
         ("Scan Timestamp", ctx.scanned_at[:19].replace("T", " ") + " UTC"),
+        ("Crime / 311 Window", f"{CRIME_DAYS_BACK} days"),
+        ("Permits Window", f"{PERMIT_DAYS_BACK} days"),
+        ("Evictions Window", f"{EVICTION_DAYS_BACK} days"),
     ])
 
-    if ctx.data_sources:
-        _subsection(pdf, "-", "Data Sources (count | date range | data as of | provider)")
-        _facts_table(pdf, [(str(src.get("label", "")), _source_line(src)) for src in ctx.data_sources])
-        _footnote(pdf, "NYPD publishes complaints and calls quarterly, so their date ranges end at the newest "
-                       "published day rather than today. A record from the last day or two can show as empty on "
-                       "NYC Open Data at random; reloading the page, sometimes a few times, shows it.")
+    risk_level = pdf_text(client.get("risk_level", "MODERATE"), default="MODERATE")
+    r, g, b = RISK_COLORS.get(risk_level, (120, 120, 120))
+    score = client.get("danger_score", "?")
+    label = pdf_text(client.get("risk_label", ""))
 
     _subsection(pdf, "1.2", "Wellness Assessment")
-    if ctx.score_available:
-        risk_level = pdf_text(client.get("risk_level", "MODERATE"), default="MODERATE")
-        r, g, b = RISK_COLORS.get(risk_level, (120, 120, 120))
-        _kpi_row(pdf, [
-            ("Wellness Score", f"{client.get('danger_score', '-')}"),
-            ("Rating", pdf_text(client.get("risk_label", ""))),
-            ("Risk Level", risk_level.title()),
-        ], accent=(r, g, b))
-    else:
-        _kpi_row(pdf, [("Wellness Score", "Not scored"), ("Rating", "-"), ("Risk Level", "-")], accent=_MUTED)
-    bands = "  |  ".join(f"{low}-{high}: {label}" for low, high, label in reversed(label_band_rows()))
-    _footnote(pdf, f"Scale: 0 (worst) to 100 (best).  {bands}")
+    _kpi_row(pdf, [
+        ("Wellness Score", f"{score}"),
+        ("Rating", label),
+        ("Risk Level", risk_level.title()),
+    ], accent=(r, g, b))
+    _footnote(pdf, "Scale: 0 (worst) to 100 (best).  " + "  |  ".join(f"{b}: {n}" for b, n in WELLNESS_BANDS))
 
     _subsection(pdf, "1.3", "Summary of Findings")
     _body_paragraph(pdf, str(client.get("risk_description", "") or "No summary available."))
-    driver = _DRIVER_NAMES.get(str(client.get("banner_driver") or ""))
-    if driver:
+    if client.get("banner_driver"):
         pdf.ln(2)
         _font_sans(pdf, "B", 7.5)
         pdf.set_text_color(*_MUTED)
         pdf.set_x(_MARGIN_L)
         pdf.cell(0, 4, "PRIMARY DRIVER", ln=True)
-        _body_paragraph(pdf, driver)
+        _body_paragraph(pdf, str(client.get("banner_driver")))
 
 
 def _render_threat_card(pdf: DossierPDF, card: dict, ctx: DossierContext, sec: str, idx: int) -> None:
     card_id = str(card.get("id", ""))
     title = pdf_text(card.get("title", ""))
-    severity = str(card.get("severity_level") or "unavailable")
-    sev = SEVERITY_LABELS.get(severity, severity.replace("_", " ").title())
-    if card.get("nyc_percentile") is not None and severity in ("quiet", "watch", "elevated"):
-        pct = int(card["nyc_percentile"])
-        sev += (f" (higher than at {pct}% of NYC apartment locations)" if pct >= 50
-                else f" (lower than at {100 - pct}% of NYC apartment locations)")
+    sev = pdf_text(card.get("severity_level", "quiet")).upper()
     subtitle = pdf_text(card.get("subtitle", ""))
 
     pdf.ln(4 if idx > 1 else 0)
@@ -798,116 +704,93 @@ def _render_threat_card(pdf: DossierPDF, card: dict, ctx: DossierContext, sec: s
     _font_sans(pdf, "B", 7.5)
     pdf.set_text_color(*_MUTED)
     pdf.set_x(_MARGIN_L)
-    pdf.cell(18, 4, "NYC LEVEL", ln=False)
+    pdf.cell(18, 4, "SEVERITY", ln=False)
     _font_sans(pdf, "B", 8)
     cr, cg, cb = _parse_hex_color(str(card.get("border_color", "")))
     pdf.set_text_color(cr, cg, cb)
-    pdf.cell(0, 4, pdf_text(sev), ln=True)
+    pdf.cell(30, 4, sev, ln=True)
     if subtitle:
         _body_paragraph(pdf, subtitle)
 
+    coord = _coord(ctx)
     dossier_ids = _dossier_ids_for_card(card_id, ctx)
-    for label, url, ds_key, scope in source_links.card_dataset_urls(
+    for label, url, ds_key in source_links.card_dataset_urls(
         card_id,
-        _coord(ctx),
+        coord,
         radius_miles=ctx.scan_radius_miles,
-        windows=_feed_windows(ctx),
+        crime_days=CRIME_DAYS_BACK,
+        reports_311_days=REPORTS_311_DAYS_BACK,
+        permit_days=PERMIT_DAYS_BACK,
+        eviction_days=EVICTION_DAYS_BACK,
+        formatted_address=ctx.formatted_address,
         dossier_ids=dossier_ids,
     ):
         short = label.replace(" (NYC Open Data)", "")
-        if scope == "scan":
-            # The link applies the scan's own filter, but an explore page lists a capped number of rows.
-            display = (f"{short} - the records counted in this scan "
-                       f"(the page lists up to {source_links.BROWSE_LIMIT:,}, newest first")
-            display += "; one row per permit and work type)" if ds_key == "permits_now" else ")"
-        elif ds_key == "permits":
-            # BIS stores coordinates as text, so its link lists the counted permits by ID, not by area.
-            n = len(dossier_ids.get(ds_key, []))
-            counted = (_feed(ctx, "permits").get("extra") or {}).get("bis_total", n)
-            display = (f"{short} - the {n:,} BIS permits counted in this scan" if n >= counted
-                       else f"{short} - {n:,} of the {counted:,} BIS permits counted in this scan")
-        else:
-            n = len(dossier_ids.get(ds_key, []))
-            display = f"{short} - the {n:,} records listed in this report"
+        has_ids = bool(dossier_ids.get(ds_key))
+        display = (
+            f"{short} — records from this report"
+            if has_ids
+            else f"{short} — filtered near this address"
+        )
         _source_ref(pdf, "Source", url, display=display)
 
-    hpd_url = source_links.hpd_violations_url(ctx.formatted_address) if card_id == "tenant_warnings" else None
-    if hpd_url:
-        _source_ref(pdf, "HPD", hpd_url, display="HPD violations for this address (NYC Open Data)")
+    if card_id == "tenant_warnings":
+        _source_ref(pdf, "HPD", source_links.hpd_violations_url(ctx.formatted_address),
+                    display="HPD violations for this address (NYC Open Data)")
 
-    bullets = [pdf_text(b) for b in (card.get("bullets") or []) if str(b or "").strip()]
+    bullets = card.get("bullets") or []
     if bullets:
-        _numbered_analysis(pdf, "Analysis", bullets)
+        _numbered_analysis(pdf, "Analysis", [pdf_text(b) for b in bullets])
 
-    if card_id in ("tenant_warnings", "oven_effect"):
+    if card_id == "tenant_warnings":
+        _footnote(pdf, "HPD violation data not ingested. Verify at the linked NYC Open Data records before signing.")
+        return
+    if card_id == "oven_effect":
+        _footnote(pdf, "Orientation guidance only. Not sourced from NYC Open Data.")
         return
     if card_id == "flight_path":
         _render_flight(pdf, ctx, inline=True)
         return
 
-    missing = [_feed(ctx, k).get("label") or k for k in _CARD_FEEDS.get(card_id, ()) if not _feed_ok(ctx, k)]
-    if missing:
-        _footnote(pdf, f"Unavailable during this scan: {', '.join(missing)}. NYC Open Data didn't respond, "
-                       "so no records are shown.")
-        if len(missing) == len(_CARD_FEEDS.get(card_id, ())):
-            return
-
-    if card_id == "police_calls":
-        pdf.ln(2)
-        _ensure_space(pdf, _HEADING_WITH_TABLE_MM)
-        _font_sans(pdf, "B", 8)
-        pdf.set_text_color(*_NAVY)
-        pdf.set_x(_MARGIN_L)
-        total = _feed(ctx, "police_calls").get("total") or 0
-        pdf.cell(0, 4, pdf_text(f"SUPPORTING DATA - NYPD CRIME-IN-PROGRESS CALLS  "
-                                f"({int(total):,} {_within(ctx, 'police_calls')})"), ln=True)
-        pdf.ln(2)
-        _institutional_table(pdf, [("Category", "label", 0.75), ("Calls", "count", 0.25)], _police_calls_rows(ctx))
-        _footnote(pdf, "Calls are summarized by priority and type here. The source link applies this scan's "
-                       f"filter and lists up to {source_links.BROWSE_LIMIT:,} of those call records, newest first.")
+    ds_title, rows, columns, total, max_rows, dataset_key = _card_data(card_id, ctx)
+    if not ds_title:
         return
 
-    data = _card_data(card_id, ctx)
-    if not data:
-        return
+    cap = " (fetch capped in dense areas)" if card_id == "reports_311" and ctx.reports_capped else ""
+    browse_url = _browse_url_for_card(card_id, ctx)
 
     pdf.ln(2)
-    _ensure_space(pdf, _HEADING_WITH_TABLE_MM)
     _font_sans(pdf, "B", 8)
     pdf.set_text_color(*_NAVY)
     pdf.set_x(_MARGIN_L)
-    pdf.multi_cell(_CONTENT_W, 4, pdf_text(f"SUPPORTING DATA - {data.title.upper()}  ({data.total_text})"))
+    pdf.cell(0, 4, pdf_text(f"SUPPORTING DATA — {ds_title.upper()}  ({total:,} records{cap})"), ln=True)
     pdf.ln(2)
+    if browse_url:
+        has_rows = total > 0
+        _source_ref(
+            pdf,
+            "Dataset",
+            browse_url,
+            display=(
+                "View report records on NYC Open Data"
+                if has_rows
+                else "View area-filtered records on NYC Open Data"
+            ),
+        )
 
     table_rows = []
-    for row in data.rows[:data.max_rows]:
+    for row in rows[:max_rows]:
         r = dict(row)
-        for _, key, _ in data.columns:
-            if key in _DATE_KEYS:
-                r[key] = _display_date(r.get(key))
-        dk = _record_dataset_key(row, data.dataset_key)
-        r["_url"] = source_links.record_url(dk, str(r.get("source_id") or "")) or ""
+        dk = _record_dataset_key(row, dataset_key)
+        r["_url"] = source_links.record_url(dk, str(r.get("source_id") or "")) or browse_url
         table_rows.append(r)
 
     if not table_rows:
-        _footnote(pdf, "No matching records within the scan radius for this date range.")
-        return
-    _institutional_table(pdf, data.columns, table_rows, link_key="_url")
-    if data.total is not None and len(table_rows) < data.total:
-        _footnote(pdf, f"Showing {len(table_rows):,} of {data.total:,} records. Counts and the Wellness Score "
-                       "use the full total.")
-
-
-def _distance_text(card: dict) -> str:
-    value, unit = card.get("distance_value"), card.get("distance_unit")
-    if value is None:
-        return "-"
-    if unit == "feet":
-        return f"{int(round(float(value))):,} ft"
-    return f"{float(value):g} mi"
-
-
-_PROVIDER_NAMES = {"google_places": "Google", "yelp": "Yelp"}
+        _footnote(pdf, "No matching records in scan radius.")
+    else:
+        _institutional_table(pdf, columns, table_rows, link_key="_url")
+        if len(rows) > max_rows:
+            _footnote(pdf, f"Showing {len(table_rows):,} of {total:,} records. Counts reflect full in-radius data.")
 
 
 def _render_dining(pdf: DossierPDF, candidates: list[dict], *, formatted_address: str, coord: Coordinate) -> None:
@@ -942,10 +825,10 @@ def _render_dining(pdf: DossierPDF, candidates: list[dict], *, formatted_address
             "_rank": str(i),
             "name": pdf_text(card.get("name", "Unknown")),
             "category": pdf_text(card.get("category", "")),
-            "source": _PROVIDER_NAMES.get(str(card.get("source") or ""), pdf_text(card.get("source", ""))),
+            "source": pdf_text(card.get("source", "")),
             "_rating": f"{rating}" if rating is not None else "-",
             "_reviews": f"{reviews:,}" if reviews else "-",
-            "_distance": _distance_text(card),
+            "_distance": f"{card.get('distance_value', '?')} {card.get('distance_unit', 'mi')}",
             "_url": source_links.dining_listing_url(card, formatted_address) or "",
         })
     _institutional_table(pdf, cols, table_rows, link_key="_url")
@@ -970,8 +853,8 @@ def _render_flight(pdf: DossierPDF, ctx: DossierContext, *, inline: bool = False
 
     _subsection(pdf, "4.1" if not inline else "-", "Exposure Metrics" if not inline else "Flight Exposure Metrics")
     stats: list[tuple[str, str]] = [
-        ("Night passes/hr", f"{night:.2f}"),
-        ("Day passes/hr", f"{day:.2f}"),
+        ("Overnight Flights/Hr", f"{night:.2f}"),
+        ("Daytime Flights/Hr", f"{day:.2f}"),
         ("Observation Window", f"{obs_days} days"),
     ]
     for key, label in [("night_percentile", "Night Percentile"), ("day_percentile", "Day Percentile")]:
@@ -989,27 +872,24 @@ def _render_flight(pdf: DossierPDF, ctx: DossierContext, *, inline: bool = False
     if alt is not None:
         notes.append(f"Typical median altitude: {alt:,} ft")
     notes.append(
-        "A pass is one aircraft seen inside the radius; it counts as a new pass only after more than "
-        "10 minutes unseen there. Night is 10 pm to 7 am New York time."
+        f"Radius {radius:g} mi  |  Elevation {exposure.get('elevation_level', 'n/a')}  |  "
+        f"Quality {exposure.get('data_quality', 'n/a')}  |  Samples {exposure.get('sample_count', 0)}"
     )
-    notes.append(
-        f"Radius {radius:g} mi  |  Level {exposure.get('elevation_level', 'n/a')}  |  "
-        f"Coverage {exposure.get('data_quality', 'n/a')}  |  ADS-B positions {int(exposure.get('sample_count') or 0):,}"
-    )
-    _numbered_analysis(pdf, "Exposure Notes", notes)
+    if notes:
+        _numbered_analysis(pdf, "Exposure Notes", notes)
     _source_ref(
         pdf,
         "Source",
-        source_links.adsb_area_url(_coord(ctx)),
-        display="Live aircraft map around this address (adsb.lol, the source ZerMap records from)",
+        source_links.opensky_area_url(_coord(ctx), radius_miles=float(radius or ctx.scan_radius_miles)),
+        display="View aircraft traffic near this address on OpenSky Network",
     )
 
     paths = ctx.flight_paths or []
     if paths:
-        _subsection(pdf, "4.2" if not inline else "-", f"Recent Aircraft Tracks ({len(paths)})")
+        _subsection(pdf, "4.2" if not inline else "-", f"Aircraft Tracks ({len(paths)})")
         path_cols = [
             ("#", "_n", 0.06), ("Route", "label", 0.22), ("Callsign", "callsign", 0.16),
-            ("Closest", "closest", 0.14), ("Altitude", "altitude", 0.14), ("Positions", "vertices", 0.12),
+            ("Closest", "closest", 0.14), ("Altitude", "altitude", 0.14), ("Vertices", "vertices", 0.12),
         ]
         path_rows = [{
             "_n": str(i), "label": pdf_text(p.get("label", "")),
@@ -1017,16 +897,15 @@ def _render_flight(pdf: DossierPDF, ctx: DossierContext, *, inline: bool = False
             "closest": f"{p.get('closest_miles', 'n/a')} mi",
             "altitude": f"{p.get('median_altitude_ft', 'n/a')} ft",
             "vertices": str(len(p.get("path") or [])),
-            "_url": source_links.adsb_aircraft_from_label(str(p.get("label", ""))) or "",
+            "_url": source_links.opensky_track_from_label(str(p.get("label", "")))
+            or source_links.opensky_area_url(_coord(ctx), radius_miles=float(radius or ctx.scan_radius_miles)),
         } for i, p in enumerate(paths, start=1)]
         _institutional_table(pdf, path_cols, path_rows, link_key="_url")
 
     adsb = ctx.adsb_samples or []
     if adsb:
         cap = 50 if inline else 80
-        shown = min(len(adsb), cap)
-        total = max(ctx.adsb_sample_total, len(adsb))
-        _subsection(pdf, "4.3" if not inline else "-", f"ADS-B Observations (newest {shown:,} of {total:,})")
+        _subsection(pdf, "4.3" if not inline else "-", f"ADS-B Observations ({min(len(adsb), cap):,} of {len(adsb):,})")
         adsb_cols = [
             ("#", "_n", 0.05), ("Observed (UTC)", "observed_at", 0.22),
             ("ICAO24", "icao24", 0.12), ("Position", "position", 0.22),
@@ -1039,11 +918,12 @@ def _render_flight(pdf: DossierPDF, ctx: DossierContext, *, inline: bool = False
             "position": f"{r.get('lat', '')}, {r.get('lng', '')}",
             "baro": f"{r.get('baro_alt_m', 'n/a')} m",
             "geo": f"{r.get('geo_alt_m', 'n/a')} m",
-            "_url": source_links.adsb_aircraft_url(str(r.get("icao24") or "")) or "",
+            "_url": source_links.opensky_track_url(str(r.get("icao24") or ""), "")
+            or source_links.opensky_area_url(_coord(ctx), radius_miles=float(radius or ctx.scan_radius_miles)),
         } for i, r in enumerate(adsb[:cap], start=1)]
         _institutional_table(pdf, adsb_cols, adsb_rows, link_key="_url")
-        if total > shown:
-            _footnote(pdf, f"{total - shown:,} more ADS-B positions inside the radius were used for the pass counts.")
+        if len(adsb) > cap:
+            _footnote(pdf, f"{len(adsb) - cap:,} additional ADS-B observations on file for this scan.")
 
 
 def build_dossier_pdf(ctx: DossierContext, client: dict) -> bytes:

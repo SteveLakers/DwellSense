@@ -1,103 +1,64 @@
 """
-Fixed threat-card chrome (ids, emoji, titles, subtitles) and the Wellness Score.
-
-Every comparison is against real measurements at sampled NYC apartment locations
-(services/nyc_baselines.py). Sources that did not answer are left out of the score
-and labeled unavailable — never treated as zero.
+Fixed threat-card chrome: ids, emoji, titles, subtitles, hex colors.
+Danger score and risk band are computed from counts in Python so Gemini
+only has to write bullet text (see ai_analysis.py).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
-from services import city_data, nyc_baselines
+from services import city_data
 
-# ── Inputs ────────────────────────────────────────────────────────────────────
+# High 311 volume should temper the wellness label even when crime is quiet.
+_HIGH_311_REPORTS_THRESHOLD = 200
+_ELEVATED_311_REPORTS_THRESHOLD = 80
 
-
-@dataclass(frozen=True)
-class ScanCounts:
-    """Exact in-radius counts per source; None = source unavailable for this scan."""
-
-    crime: int | None = None
-    crime_major_felonies: int | None = None
-    crime_violent: int | None = None
-    police_calls: int | None = None
-    police_calls_critical: int | None = None
-    reports_311: int | None = None
-    reports_311_noise: int | None = None
-    reports_311_construction: int | None = None
-    permits: int | None = None
-    permits_demolition: int | None = None
-    evictions: int | None = None
-
-    @classmethod
-    def from_feeds(
-        cls,
-        *,
-        crime: city_data.FeedResult,
-        police_calls: city_data.FeedResult,
-        reports_311: city_data.FeedResult,
-        permits: city_data.FeedResult,
-        evictions: city_data.FeedResult,
-    ) -> "ScanCounts":
-        def total(f: city_data.FeedResult) -> int | None:
-            return f.count() if f.available else None
-
-        def part(f: city_data.FeedResult, name: str) -> int | None:
-            return f.part(name) if f.available else None
-
-        return cls(
-            crime=total(crime),
-            crime_major_felonies=part(crime, "major_felonies"),
-            crime_violent=part(crime, "violent"),
-            police_calls=total(police_calls),
-            police_calls_critical=part(police_calls, "critical"),
-            reports_311=total(reports_311),
-            reports_311_noise=part(reports_311, "noise"),
-            reports_311_construction=part(reports_311, "construction"),
-            permits=total(permits),
-            permits_demolition=part(permits, "demolition"),
-            evictions=total(evictions),
-        )
-
-
-def nyc_percentile(metric: str, value: int | float | None) -> float | None:
-    """Share of sampled NYC apartment locations below value (None if unmeasured)."""
-    if value is None:
-        return None
-    return nyc_baselines.percentile(metric, float(value))
-
-
-# ── Score model ───────────────────────────────────────────────────────────────
-
-# factor -> (baseline metric, weight). Weights sum to 1.
-_SCORE_FACTORS: dict[str, tuple[str, float]] = {
-    "crime": ("crime_total", 0.40),
-    "311": ("reports_311_total", 0.26),
-    "permits": ("permits_total", 0.14),
-    "evictions": ("evictions_total", 0.20),
+# Percentile anchors for wellness scoring (shared by score + banner reasoning).
+_SCORE_CALIB: dict[str, tuple[float, float]] = {
+    "crime": (8, 42),
+    "311": (15, 65),
+    "permits": (1, 7),
+    "evictions": (0.5, 3),
 }
-# Minimum weight that must be measured to show a score (e.g. NYPD + 311, or NYPD + two others).
-_MIN_SCORED_WEIGHT = 0.66
-_DENSE_CITY_OFFSET = 5
-
-# Soft ceilings, as NYC percentiles (highest first).
-_CAPS: dict[str, list[tuple[float, int]]] = {
-    "crime": [(0.57, 38), (0.24, 50), (0.11, 58)],
-    "evictions": [(0.83, 44), (0.66, 54)],
-    "permits": [(0.81, 52), (0.66, 62)],
+_SCORE_WEIGHTS: dict[str, float] = {
+    "crime": 0.40,
+    "311": 0.26,
+    "permits": 0.14,
+    "evictions": 0.20,
 }
-_CAP_NAMES = {"crime": "NYPD complaints", "evictions": "residential evictions", "permits": "active construction permits"}
+_MIN_DRAG_TO_MENTION = 4.0
+# Banner-only 2 mi NYC calibration (score math uses _SCORE_CALIB unchanged).
+_BANNER_DRAG_CALIB: dict[str, tuple[float, float]] = {
+    "area_safety": (8, 42),
+    "311": (2000, 4000),
+    "permits": (2, 8),
+    "evictions": (0.5, 3),
+    "noise": (180, 550),
+}
+_BANNER_WEIGHTS: dict[str, float] = {
+    "area_safety": 0.40,
+    "311": 0.26,
+    "permits": 0.14,
+    "evictions": 0.20,
+    "noise": 0.11,
+}
+_MIN_FACTOR_PERCENTILE = 0.32
+# Hide routine 311 when another factor is clearly more notable for this address.
+_SUPPRESS_311_BELOW_PERCENTILE = 0.42
 
-# Excellent / Outstanding need several signals that are low for NYC.
-_TOP_TIER_BLOCKERS = {"crime": 0.108, "evictions": 0.656, "311": 0.959, "permits": 0.75}
-_TOP_TIER_SOFT = {"311": 0.81, "permits": 0.5}
-_TOP_TIER_SOFT_MIN_SCORE = 86
+_FACTOR_LABELS: dict[str, tuple[str, str, str]] = {
+    "area_safety": ("area safety", "crime report", "crime reports"),
+    "311": ("city reports", "city report", "city reports"),
+    "permits": ("construction", "permit", "permits"),
+    "evictions": ("evictions", "filing", "filings"),
+    "noise": ("noise", "complaint", "complaints"),
+}
 
-# Wellness score 0–100, higher is better.
-LABEL_BANDS: list[tuple[int, str, str]] = [
+# v2 label bands (wellness score 0–100, higher is better).
+_LABEL_BANDS: list[tuple[int, str, str]] = [
     (15, "EXTREME", "Terrible"),
     (28, "HIGH", "Bad"),
     (48, "MODERATE", "Average"),
@@ -108,293 +69,81 @@ LABEL_BANDS: list[tuple[int, str, str]] = [
     (100, "LOW", "Outstanding"),
 ]
 
-
-def label_band_rows() -> list[tuple[int, int, str]]:
-    """(low, high, label) rows for display, derived from LABEL_BANDS."""
-    rows = []
-    low = 0
-    for ceiling, _, label in LABEL_BANDS:
-        rows.append((low, ceiling, label))
-        low = ceiling + 1
-    return rows
-
-
-def _factor_value(counts: ScanCounts, factor: str) -> int | None:
-    return {
-        "crime": counts.crime,
-        "311": counts.reports_311,
-        "permits": counts.permits,
-        "evictions": counts.evictions,
-    }[factor]
-
-
-def score_percentiles(counts: ScanCounts) -> dict[str, float | None]:
-    return {
-        factor: nyc_percentile(metric, _factor_value(counts, factor))
-        for factor, (metric, _) in _SCORE_FACTORS.items()
-    }
-
-
-def _label_for_score(score: int, pcts: dict[str, float | None], counts: ScanCounts) -> tuple[str, str]:
-    risk_level, risk_label = "MODERATE", "Average"
-    for ceiling, level, label in LABEL_BANDS:
-        if score <= ceiling:
-            risk_level, risk_label = level, label
-            break
-    if risk_label not in ("Excellent", "Outstanding"):
-        return risk_level, risk_label
-
-    if any(p is None for p in pcts.values()):
-        return "LOW", "Great"
-    all_zero = all((_factor_value(counts, f) or 0) == 0 for f in _SCORE_FACTORS)
-    if all_zero:
-        # An empty radius is more likely missing coverage than proof of excellence.
-        return "LOW", "Very Good"
-    if any((pcts[f] or 0) >= cut for f, cut in _TOP_TIER_BLOCKERS.items()):
-        return "LOW", "Great"
-    if any((pcts[f] or 0) >= cut for f, cut in _TOP_TIER_SOFT.items()):
-        return "LOW", "Excellent" if score >= _TOP_TIER_SOFT_MIN_SCORE else "Great"
-    return risk_level, risk_label
-
-
-@dataclass(frozen=True)
-class ScoreResult:
-    available: bool
-    score: int
-    base_score: int
-    percentiles: dict[str, float | None]
-    caps_applied: list[str]
-    unavailable_factors: list[str]
-
-
-def compute_score(counts: ScanCounts) -> ScoreResult:
-    pcts = score_percentiles(counts)
-    measured = {f: p for f, p in pcts.items() if p is not None}
-    weight = sum(_SCORE_FACTORS[f][1] for f in measured)
-    unavailable = [f for f, p in pcts.items() if p is None]
-    if weight < _MIN_SCORED_WEIGHT or "crime" not in measured:
-        return ScoreResult(False, 0, 0, pcts, [], unavailable)
-
-    hazard = sum(_SCORE_FACTORS[f][1] * p for f, p in measured.items()) / weight
-    base = int(round(max(0.0, min(100.0, 100.0 - hazard * 100.0)))) - _DENSE_CITY_OFFSET
-    base = max(0, base)
-    score = base
-    caps: list[str] = []
-    for factor, steps in _CAPS.items():
-        p = measured.get(factor)
-        if p is None:
-            continue
-        for cut, ceiling in steps:
-            if p >= cut:
-                if score > ceiling:
-                    score = ceiling
-                    caps.append(factor)
-                break
-    return ScoreResult(True, score, base, pcts, caps, unavailable)
-
-
-# ── Banner text ───────────────────────────────────────────────────────────────
-
-_BANNER_FACTORS: dict[str, tuple[str, float, str, str]] = {
-    # driver -> (baseline metric, tie-break weight, singular, plural)
-    "area_safety": ("crime_total", 0.40, "NYPD complaint", "NYPD complaints"),
-    "311": ("reports_311_total", 0.26, "request to 311", "requests to 311"),
-    "permits": ("permits_total", 0.14, "active construction permit", "active construction permits"),
-    "evictions": ("evictions_total", 0.20, "residential eviction", "residential evictions"),
-    "noise": ("reports_311_noise", 0.11, "noise complaint", "noise complaints"),
-}
-_MIN_DRIVER_PERCENTILE = 0.60
-_SECOND_DRIVER_WITHIN = 0.14
-_UNAVAILABLE_NAMES = {
-    "crime": "NYPD complaints",
-    "311": "311 requests",
-    "permits": "DOB permits",
-    "evictions": "evictions",
-}
-
-
-def _driver_values(counts: ScanCounts) -> dict[str, int | None]:
-    return {
-        "area_safety": counts.crime,
-        "311": counts.reports_311,
-        "permits": counts.permits,
-        "evictions": counts.evictions,
-        "noise": counts.reports_311_noise,
-    }
-
-
-def pick_banner_drivers(counts: ScanCounts) -> list[tuple[str, int, float]]:
-    """1–2 signals that stand out most vs. NYC apartment locations (percentile, not raw volume)."""
-    candidates = []
-    for kind, value in _driver_values(counts).items():
-        metric, weight, _, _ = _BANNER_FACTORS[kind]
-        p = nyc_percentile(metric, value)
-        if value is None or p is None or p < _MIN_DRIVER_PERCENTILE:
-            continue
-        candidates.append((kind, value, p, weight * p))
-    candidates.sort(key=lambda row: (-row[2], -row[3]))
-    drivers = [(k, v, p) for k, v, p, _ in candidates[:1]]
-    if len(candidates) > 1 and candidates[1][2] >= candidates[0][2] - _SECOND_DRIVER_WITHIN:
-        drivers.append(candidates[1][:3])
-    return drivers
-
-
-def _driver_phrase(kind: str, value: int, percentile: float, *, first: bool) -> str:
-    _, _, singular, plural = _BANNER_FACTORS[kind]
-    word = singular if value == 1 else plural
-    pct = int(round(percentile * 100))
-    if first:
-        return f"{value:,} {word} — higher than at {pct}% of NYC apartment locations"
-    return f"{value:,} {word} (higher than at {pct}%)"
-
-
-def _join_names(names: list[str]) -> str:
-    if len(names) <= 1:
-        return "".join(names)
-    return f"{', '.join(names[:-1])} and {names[-1]}"
-
-
-def _binding_cap(result: ScoreResult) -> tuple[str, float, int] | None:
-    """(factor, percentile cut, ceiling) of the cap that set the final score."""
-    if not result.caps_applied:
-        return None
-    factor = result.caps_applied[-1]
-    p = result.percentiles.get(factor)
-    for cut, ceiling in _CAPS[factor]:
-        if p is not None and p >= cut:
-            return factor, cut, ceiling
-    return None
-
-
-def build_risk_description(counts: ScanCounts, result: ScoreResult) -> tuple[str, str | None]:
-    mi = f"{city_data.get_scan_radius_miles():g} mi"
-    missing = [_UNAVAILABLE_NAMES[f] for f in result.unavailable_factors]
-    if not result.available:
-        return (
-            f"Not scored: {_join_names(missing) or 'too few sources'} unavailable right now. "
-            "The cards below show what did load.",
-            None,
-        )
-
-    drivers = pick_banner_drivers(counts)
-    if drivers:
-        parts = [_driver_phrase(k, v, p, first=i == 0) for i, (k, v, p) in enumerate(drivers)]
-        sentence = f"{'; '.join(parts)} — within {mi}."
-    else:
-        sentence = f"Nothing stands out compared with typical NYC apartment locations within {mi}."
-
-    notes = []
-    cap = _binding_cap(result)
-    if cap:
-        factor, cut, ceiling = cap
-        notes.append(
-            f"Capped at {ceiling}: a higher score needs {_CAP_NAMES[factor]} in the lowest "
-            f"{round(cut * 100)}% of NYC apartment locations."
-        )
-    if missing:
-        names = _join_names(missing)
-        notes.append(f"{names[:1].upper()}{names[1:]} unavailable — scored on the other sources.")
-    text = " ".join([sentence, *notes])
-    return text, (drivers[0][0] if drivers else None)
-
-
-def compute_risk_from_counts(counts: ScanCounts) -> dict[str, Any]:
-    """`danger_score` is the Wellness Score: 0–100 where 100 is best."""
-    result = compute_score(counts)
-    description, driver = build_risk_description(counts, result)
-    if not result.available:
-        return {
-            "danger_score": 0,
-            "risk_level": "MODERATE",
-            "risk_label": "Not scored",
-            "risk_description": description,
-            "banner_driver": None,
-            "score_available": False,
-        }
-    risk_level, risk_label = _label_for_score(result.score, result.percentiles, counts)
-    return {
-        "danger_score": result.score,
-        "risk_level": risk_level,
-        "risk_label": risk_label,
-        "risk_description": description,
-        "banner_driver": driver,
-        "score_available": True,
-    }
-
-
-# ── Cards ─────────────────────────────────────────────────────────────────────
-
-# Order matches the UI carousel / Gemini system prompt.
+# Order matches the UI carousel / original Gemini system prompt.
 CARD_SPECS: list[dict[str, Any]] = [
     {
         "id": "high_churn",
         "emoji": "🏃‍♂️",
         "title": "TENANT CHURN",
-        "subtitle": "Residential evictions carried out by NYC Marshals.",
+        "subtitle": "Historical turnover data from NYC court records.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "police_calls",
         "emoji": "🚓",
         "title": "POLICE CALLS",
-        "subtitle": "Crime-in-progress 911 calls dispatched to NYPD.",
+        "subtitle": "NYPD dispatch activity in the area.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "area_safety",
         "emoji": "🛡️",
         "title": "AREA SAFETY",
-        "subtitle": "NYPD crime complaints, including the seven major felonies.",
+        "subtitle": "Property and violent crime density.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "tenant_warnings",
         "emoji": "🗣️",
         "title": "TENANT WARNINGS",
-        "subtitle": "Building violations aren't checked yet — look them up on HPD Online.",
+        "subtitle": "HPD violation data not ingested; verify on NYC HPD portal.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "demolitions",
         "emoji": "🚧",
         "title": "CONSTRUCTION & DEMOLITIONS",
-        "subtitle": "Active DOB permits for disruptive work and 311 construction complaints.",
+        "subtitle": "DOB active permits and 311 building complaints.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "noise_schedule",
-        "emoji": "🔊",
-        "title": "NOISE COMPLAINTS",
-        "subtitle": "311 noise complaints from neighbors.",
+        "emoji": "🚛",
+        "title": "NOISE SCHEDULE",
+        "subtitle": "Commercial and municipal noise sources.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "flight_path",
         "emoji": "✈️",
         "title": "FLIGHT NOISE",
-        "subtitle": "Low-altitude aircraft passes vs. NYC apartment locations (ADS-B).",
+        "subtitle": "Aircraft exposure vs typical NYC blocks (ADS-B).",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "reports_311",
         "emoji": "🐀",
         "title": "311 REPORTS",
-        "subtitle": "311 service requests (parking and vehicle complaints excluded).",
+        "subtitle": "City service complaints from neighbors.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
     {
         "id": "oven_effect",
         "emoji": "☀️",
         "title": "OVEN EFFECT",
-        "subtitle": "General tip — not measured for this building.",
+        "subtitle": "Sun exposure and AC cost risk.",
+        "border_color": "#64748b",
+        "text_color": "#94a3b8",
     },
 ]
-
-# Card -> baseline metrics; severity uses the highest percentile among them, so a card with any
-# metric unavailable is unavailable (the missing one could be the highest).
-CARD_METRICS: dict[str, list[tuple[str, str]]] = {
-    "high_churn": [("evictions_total", "evictions")],
-    "police_calls": [("police_calls_total", "police_calls")],
-    "area_safety": [("crime_major_felonies", "crime_major_felonies")],
-    "demolitions": [("permits_total", "permits"), ("reports_311_construction", "reports_311_construction")],
-    "noise_schedule": [("reports_311_noise", "reports_311_noise")],
-    "reports_311": [("reports_311_total", "reports_311")],
-}
-_FIXED_SEVERITY = {"tenant_warnings": "not_checked", "oven_effect": "tip"}
-_TIER_WATCH = 0.35
-_TIER_ELEVATED = 0.70
 
 
 def ordered_card_ids() -> list[str]:
@@ -414,53 +163,496 @@ def filter_threat_cards_for_exposure(
 
 @dataclass(frozen=True)
 class CardChromeContext:
-    counts: ScanCounts = ScanCounts()
-    flight_percentile: float | None = None
+    crime_count: int = 0
+    reports_count: int = 0
+    permit_count: int = 0
+    eviction_count: int = 0
+    noise_count: int = 0
+    construction_311_count: int = 0
+    has_flight_path: bool = False
     show_flight_feature: bool = False
 
 
+# Muted severity palette — matches wellness banner: emerald (clear) / amber (watch) / rose (elevated).
 _SEVERITY_CHROME: dict[str, tuple[str, str]] = {
     "quiet": ("#059669", "#6ee7b7"),
     "watch": ("#d97706", "#fbbf24"),
     "elevated": ("#f43f5e", "#fda4af"),
-    "unavailable": ("#64748b", "#94a3b8"),
-    "not_checked": ("#64748b", "#94a3b8"),
-    "tip": ("#0284c7", "#7dd3fc"),
 }
 
 
-def card_percentile(card_id: str, ctx: CardChromeContext) -> float | None:
+def _card_severity(card_id: str, ctx: CardChromeContext) -> str:
+    """Return quiet | watch | elevated for this card's primary signal."""
+    if card_id == "high_churn":
+        return "elevated" if ctx.eviction_count > 0 else "quiet"
+    if card_id == "police_calls":
+        return "elevated" if ctx.crime_count > 0 else "quiet"
+    if card_id == "area_safety":
+        return "watch" if ctx.crime_count > 0 else "quiet"
+    if card_id == "tenant_warnings":
+        return "quiet"
+    if card_id == "demolitions":
+        has_activity = ctx.permit_count > 0 or ctx.construction_311_count > 0
+        return "watch" if has_activity else "quiet"
+    if card_id == "noise_schedule":
+        return "watch" if ctx.noise_count > 0 else "quiet"
     if card_id == "flight_path":
-        return ctx.flight_percentile
-    best: float | None = None
-    for metric, field_name in CARD_METRICS.get(card_id, []):
-        p = nyc_percentile(metric, getattr(ctx.counts, field_name))
-        if p is None:
-            return None
-        if best is None or p > best:
-            best = p
-    return best
-
-
-def card_severity(card_id: str, ctx: CardChromeContext) -> str:
-    if card_id in _FIXED_SEVERITY:
-        return _FIXED_SEVERITY[card_id]
-    p = card_percentile(card_id, ctx)
-    if p is None:
-        return "unavailable"
-    if p >= _TIER_ELEVATED:
-        return "elevated"
-    if p >= _TIER_WATCH:
-        return "watch"
+        if not ctx.show_flight_feature:
+            return "quiet"
+        return "elevated" if ctx.has_flight_path else "watch"
+    if card_id == "reports_311":
+        if ctx.reports_count >= _HIGH_311_REPORTS_THRESHOLD:
+            return "elevated"
+        if ctx.reports_count > 0:
+            return "watch"
+        return "quiet"
+    if card_id == "oven_effect":
+        return "quiet"
     return "quiet"
+
+
+def resolve_card_colors(card_id: str, ctx: CardChromeContext) -> tuple[str, str]:
+    """Border + subtitle colors from muted severity tier."""
+    return _SEVERITY_CHROME[_card_severity(card_id, ctx)]
+
+
+def _percentile_from_count(
+    x: int,
+    *,
+    median_count: float,
+    p90_count: float,
+) -> float:
+    x = max(0, int(x))
+    lx = math.log1p(x)
+    l50 = math.log1p(max(0.0, float(median_count)))
+    l90 = math.log1p(max(1e-6, float(p90_count)))
+    denom = max(1e-6, (l90 - l50))
+    k = 2.2 / denom
+    z = (lx - l50) * k
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def _base_wellness_score(
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int,
+) -> int:
+    """Single hazard → wellness model (NYC-calibrated percentiles, inverted)."""
+    drags, _ = _score_factor_drags(crime_count, reports_count, permit_count, eviction_count)
+    hazard_01 = sum(drags.values()) / 100.0
+    wellness = int(round(max(0.0, min(100.0, 100.0 - hazard_01 * 100.0))))
+    # NYC realism: dense city baseline, not suburb scoring.
+    return max(0, wellness - 5)
+
+
+def _apply_311_adjustment(
+    wellness: int,
+    *,
+    crime_count: int,
+    reports_count: int,
+) -> int:
+    """One 311 path — extra penalty when complaint volume is high but crime is quiet."""
+    if reports_count >= _HIGH_311_REPORTS_THRESHOLD and crime_count < 8:
+        excess = reports_count - _HIGH_311_REPORTS_THRESHOLD
+        penalty = min(24, int(4.5 * math.log1p(excess / 45)))
+        return max(0, wellness - penalty)
+    if reports_count >= _ELEVATED_311_REPORTS_THRESHOLD and crime_count < 5:
+        excess = reports_count - _ELEVATED_311_REPORTS_THRESHOLD
+        penalty = min(12, int(2.5 * math.log1p(excess / 90)))
+        return max(0, wellness - penalty)
+    return wellness
+
+
+def _apply_safety_caps(
+    wellness: int,
+    *,
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int,
+    capped: bool,
+) -> int:
+    """Soft ceilings for serious signals — avoids stacking with duplicate penalties."""
+    score = wellness
+    if crime_count >= 10:
+        score = min(score, 38)
+    elif crime_count >= 3:
+        score = min(score, 50)
+    elif crime_count >= 1:
+        score = min(score, 58)
+
+    if eviction_count >= 2:
+        score = min(score, 44)
+    elif eviction_count >= 1:
+        score = min(score, 54)
+
+    if permit_count >= 4:
+        score = min(score, 52)
+    elif permit_count >= 2:
+        score = min(score, 62)
+
+    if capped:
+        score = min(score, 74)
+
+    return max(0, score)
+
+
+def _label_for_score(
+    score: int,
+    *,
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int,
+) -> tuple[str, str]:
+    """Map score to label; gate Excellent/Outstanding on multiple clean signals."""
+    risk_level = "MODERATE"
+    risk_label = "Average"
+    for ceiling, level, label in _LABEL_BANDS:
+        if score <= ceiling:
+            risk_level, risk_label = level, label
+            break
+
+    # Empty radius is often sparse data, not proof of excellence.
+    all_clear = (
+        crime_count == 0
+        and reports_count == 0
+        and permit_count == 0
+        and eviction_count == 0
+    )
+    if all_clear and risk_label in ("Excellent", "Outstanding", "Great"):
+        risk_level, risk_label = "LOW", "Very Good"
+
+    # Top tiers require more than one clean signal.
+    if risk_label in ("Excellent", "Outstanding"):
+        if crime_count > 0 or eviction_count > 0 or reports_count >= 120 or permit_count >= 3:
+            risk_level, risk_label = "LOW", "Great"
+        elif reports_count >= 40 or permit_count >= 1:
+            risk_level, risk_label = "LOW", "Excellent" if score >= 86 else "Great"
+
+    return risk_level, risk_label
+
+
+def _format_count(n: int) -> str:
+    return f"{int(n):,}"
+
+
+def _volume_word(percentile: float) -> str:
+    if percentile >= 0.58:
+        return "A lot of"
+    if percentile >= 0.32:
+        return "Some"
+    return "Little"
+
+
+def _factor_percentile(kind: str, count: int) -> float:
+    median, p90 = _BANNER_DRAG_CALIB[kind]
+    return _percentile_from_count(count, median_count=median, p90_count=p90)
+
+
+def _factor_banner_line(kind: str, count: int, *, percentile: float | None = None) -> str:
+    """Qualitative label first, then the exact count (2 mi banner calibration)."""
+    p = percentile if percentile is not None else _factor_percentile(kind, count)
+    volume = _volume_word(p)
+    label, singular, plural = _FACTOR_LABELS[kind]
+
+    if kind == "area_safety":
+        n = _format_count(count) if count >= 10 else str(count)
+        word = singular if count == 1 else plural
+        if p < 0.58:
+            return f"Area safety — {n} {word}"
+        return f"{volume} area safety concerns — {n} {word}"
+
+    if kind == "311":
+        word = singular if count == 1 else plural
+        if p < 0.58:
+            return f"City reports — {_format_count(count)} {word}"
+        return f"{volume} 311 reports — {_format_count(count)} {word}"
+
+    if kind == "noise":
+        word = singular if count == 1 else plural
+        n = _format_count(count) if count >= 10 else str(count)
+        if p < 0.58:
+            return f"Noise complaints — {n} {word}"
+        return f"{volume} noise complaints — {n} {word}"
+
+    word = singular if count == 1 else plural
+    return f"{volume} {label} — {count} {word}"
+
+
+def _score_factor_drags(
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Points each municipal factor pulls off a perfect 100 (same math as scoring)."""
+    counts = {
+        "crime": crime_count,
+        "311": reports_count,
+        "permits": permit_count,
+        "evictions": eviction_count,
+    }
+    percentiles: dict[str, float] = {}
+    drags: dict[str, float] = {}
+    for kind, count in counts.items():
+        median, p90 = _SCORE_CALIB[kind]
+        percentile = _percentile_from_count(count, median_count=median, p90_count=p90)
+        percentiles[kind] = percentile
+        drags[kind] = _SCORE_WEIGHTS[kind] * percentile * 100.0
+    return drags, percentiles
+
+
+def _cap_explanation(
+    score_before_caps: int,
+    score_after_caps: int,
+    crime_count: int,
+    permit_count: int,
+    eviction_count: int,
+    *,
+    capped: bool,
+) -> str | None:
+    """Short note when a safety or sample cap limited the score."""
+    if score_after_caps >= score_before_caps:
+        return None
+
+    notes: list[str] = []
+    if crime_count >= 10 and score_after_caps <= 38:
+        notes.append("high crime cap")
+    elif crime_count >= 3 and score_after_caps <= 50:
+        notes.append("crime cap")
+    elif crime_count >= 1 and score_after_caps <= 58:
+        notes.append("crime cap")
+
+    if eviction_count >= 2 and score_after_caps <= 44:
+        notes.append("eviction cap")
+    elif eviction_count >= 1 and score_after_caps <= 54:
+        notes.append("eviction cap")
+
+    if permit_count >= 4 and score_after_caps <= 52:
+        notes.append("construction cap")
+    elif permit_count >= 2 and score_after_caps <= 62:
+        notes.append("construction cap")
+
+    if capped and score_after_caps <= 74:
+        notes.append("sample count cap")
+
+    if not notes:
+        return "Capped by a safety limit."
+    if len(notes) == 1:
+        return f"Capped due to {notes[0]}."
+    return f"Capped due to {' and '.join(notes[:2])}."
+
+
+def _pick_banner_drivers(
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int,
+    noise_count: int,
+    extra_311_drag: float,
+) -> list[tuple[str, int, float]]:
+    """
+    Pick 1–2 factors that best explain this address vs typical NYC ~2 mi blocks.
+
+    Rank by how elevated each signal is for its own category (percentile), not raw
+    311 volume — so area safety, noise, construction, or evictions can lead when they stand out.
+    """
+    counts = {
+        "area_safety": crime_count,
+        "311": reports_count,
+        "permits": permit_count,
+        "evictions": eviction_count,
+        "noise": noise_count,
+    }
+    candidates: list[tuple[str, int, float, float]] = []
+    for kind, count in counts.items():
+        if count <= 0:
+            continue
+        percentile = _factor_percentile(kind, count)
+        if percentile < _MIN_FACTOR_PERCENTILE:
+            continue
+        tie_break = _BANNER_WEIGHTS[kind] * percentile
+        candidates.append((kind, count, percentile, tie_break))
+
+    if not candidates:
+        return []
+
+    non_311 = [row for row in candidates if row[0] != "311"]
+    if non_311 and any(row[2] >= _SUPPRESS_311_BELOW_PERCENTILE for row in non_311):
+        candidates = [
+            row
+            for row in candidates
+            if not (
+                row[0] == "311"
+                and row[2] < _SUPPRESS_311_BELOW_PERCENTILE
+                and extra_311_drag < _MIN_DRAG_TO_MENTION
+            )
+        ]
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda row: (-row[2], -row[3]))
+    top_kind, top_count, top_p, _ = candidates[0]
+    drivers: list[tuple[str, int, float]] = [(top_kind, top_count, top_p)]
+
+    if len(candidates) > 1:
+        second_kind, second_count, second_p, _ = candidates[1]
+        if second_p >= top_p - 0.14:
+            drivers.append((second_kind, second_count, second_p))
+
+    return drivers
+
+
+def _build_risk_description(
+    wellness: int,
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int,
+    noise_count: int,
+    *,
+    capped: bool,
+) -> tuple[str, str | None]:
+    """Explain the wellness score using the same inputs and adjustments as scoring."""
+    scan_mi = city_data.get_scan_radius_miles()
+    mi_label = f"~{scan_mi:g} mi"
+    counts = {
+        "area_safety": crime_count,
+        "311": reports_count,
+        "permits": permit_count,
+        "evictions": eviction_count,
+        "noise": noise_count,
+    }
+
+    all_clear = all(counts[k] == 0 for k in counts)
+    if all_clear:
+        return (
+            (
+                f"No area safety issues, city reports, evictions, construction permits, "
+                f"or noise complaints in {mi_label}."
+            ),
+            None,
+        )
+
+    score_after_base = _base_wellness_score(
+        crime_count, reports_count, permit_count, eviction_count
+    )
+    score_after_311 = _apply_311_adjustment(
+        score_after_base,
+        crime_count=crime_count,
+        reports_count=reports_count,
+    )
+    extra_311_drag = float(score_after_base - score_after_311)
+    score_after_caps = _apply_safety_caps(
+        score_after_311,
+        crime_count=crime_count,
+        reports_count=reports_count,
+        permit_count=permit_count,
+        eviction_count=eviction_count,
+        capped=capped,
+    )
+
+    drivers = _pick_banner_drivers(
+        crime_count,
+        reports_count,
+        permit_count,
+        eviction_count,
+        noise_count,
+        extra_311_drag,
+    )
+
+    cap_note = _cap_explanation(
+        score_after_311,
+        score_after_caps,
+        crime_count,
+        permit_count,
+        eviction_count,
+        capped=capped,
+    )
+
+    if not drivers:
+        sentence = f"Nothing major in {mi_label}."
+    elif len(drivers) == 1:
+        kind, count, percentile = drivers[0]
+        sentence = f"{_factor_banner_line(kind, count, percentile=percentile)} in {mi_label}."
+    else:
+        parts = [
+            _factor_banner_line(kind, count, percentile=percentile)
+            for kind, count, percentile in drivers
+        ]
+        sentence = f"{' and '.join(parts)} in {mi_label}."
+
+    primary_driver = drivers[0][0] if drivers else None
+    if cap_note:
+        return f"{sentence} {cap_note}", primary_driver
+    return sentence, primary_driver
+
+
+def compute_risk_from_counts(
+    crime_count: int,
+    reports_count: int,
+    permit_count: int,
+    eviction_count: int = 0,
+    noise_count: int = 0,
+    *,
+    crime_capped: bool = False,
+    reports_capped: bool = False,
+    permits_capped: bool = False,
+    evictions_capped: bool = False,
+) -> dict[str, Any]:
+    """
+    v2 wellness scoring: one percentile model + one 311 adjustment + soft caps + gated labels.
+    `danger_score` is 0–100 where **100 is best**.
+    """
+    capped = crime_capped or reports_capped or permits_capped or evictions_capped
+
+    wellness = _base_wellness_score(crime_count, reports_count, permit_count, eviction_count)
+    wellness = _apply_311_adjustment(
+        wellness, crime_count=crime_count, reports_count=reports_count
+    )
+    wellness = _apply_safety_caps(
+        wellness,
+        crime_count=crime_count,
+        reports_count=reports_count,
+        permit_count=permit_count,
+        eviction_count=eviction_count,
+        capped=capped,
+    )
+    risk_level, risk_label = _label_for_score(
+        wellness,
+        crime_count=crime_count,
+        reports_count=reports_count,
+        permit_count=permit_count,
+        eviction_count=eviction_count,
+    )
+
+    risk_description, banner_driver = _build_risk_description(
+        wellness,
+        crime_count,
+        reports_count,
+        permit_count,
+        eviction_count,
+        noise_count,
+        capped=capped,
+    )
+
+    return {
+        "danger_score": wellness,
+        "risk_level": risk_level,
+        "risk_label": risk_label,
+        "risk_description": risk_description,
+        "banner_driver": banner_driver,
+    }
 
 
 def cards_from_specs_and_bullets(
     bullets_by_id: dict[str, list[str]],
     chrome: CardChromeContext | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge fixed chrome with up to four bullets per card — three facts plus an optional
-    Gemini takeaway (order follows CARD_SPECS)."""
+    """Merge fixed chrome with three bullets per card (order follows CARD_SPECS)."""
     ctx = chrome or CardChromeContext()
     out: list[dict[str, Any]] = []
     for spec in CARD_SPECS:
@@ -468,16 +660,16 @@ def cards_from_specs_and_bullets(
         raw = bullets_by_id.get(cid)
         if not isinstance(raw, list):
             raw = []
-        b = [s for s in (str(x).strip() for x in raw if x is not None) if s][:4]
-        severity = card_severity(cid, ctx)
-        border_color, text_color = _SEVERITY_CHROME[severity]
-        p = card_percentile(cid, ctx) if severity in ("quiet", "watch", "elevated") else None
+        b = [str(x).strip() if x is not None else "" for x in raw[:3]]
+        while len(b) < 3:
+            b.append("")
+        border_color, text_color = resolve_card_colors(cid, ctx)
+        severity = _card_severity(cid, ctx)
         out.append({
             **spec,
             "border_color": border_color,
             "text_color": text_color,
             "severity_level": severity,
-            "nyc_percentile": int(round(p * 100)) if p is not None else None,
             "bullets": b,
         })
     return out

@@ -6,9 +6,7 @@ import {
   AuthAlert,
   AuthField,
   AuthShell,
-  authFooterClassName,
   authInputClassName,
-  authLinkClassName,
   authPrimaryButtonClassName,
 } from "@/components/AuthShell";
 import { useAuth } from "@/components/AuthProvider";
@@ -54,11 +52,10 @@ export default function ForgotPasswordPage() {
 
   return (
     <AuthShell
-      title="Reset your password"
-      subtitle="Enter your email and we’ll send you a reset link."
+      subtitle="Reset your password."
       footer={
-        <p className={authFooterClassName}>
-          <Link href="/sign-in" className={authLinkClassName}>
+        <p className="mt-4 text-center text-sm text-slate-400">
+          <Link href="/sign-in" className="text-rose-400 hover:text-rose-300 font-medium">
             Back to sign in
           </Link>
         </p>
@@ -70,7 +67,7 @@ export default function ForgotPasswordPage() {
       {error && <AuthAlert tone="error">{error}</AuthAlert>}
       {message && <AuthAlert tone="success">{message}</AuthAlert>}
 
-      <form onSubmit={onSubmit} noValidate className="space-y-4">
+      <form onSubmit={onSubmit} noValidate className="space-y-3">
         <AuthField label="Email">
           <input
             type="text"

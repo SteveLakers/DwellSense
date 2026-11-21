@@ -6,9 +6,7 @@ import {
   AuthAlert,
   AuthField,
   AuthShell,
-  authFooterClassName,
   authInputClassName,
-  authLinkClassName,
   authPrimaryButtonClassName,
 } from "@/components/AuthShell";
 import { useAuth } from "@/components/AuthProvider";
@@ -62,11 +60,10 @@ export default function UpdatePasswordPage() {
 
   return (
     <AuthShell
-      title="Set a new password"
-      subtitle="Choose a new password for your account."
+      subtitle="Choose a new password."
       footer={
-        <p className={authFooterClassName}>
-          <Link href="/" className={authLinkClassName}>
+        <p className="mt-4 text-center text-sm text-slate-400">
+          <Link href="/" className="text-rose-400 hover:text-rose-300 font-medium">
             Back to home
           </Link>
         </p>
@@ -75,7 +72,7 @@ export default function UpdatePasswordPage() {
       {error && <AuthAlert tone="error">{error}</AuthAlert>}
       {message && <AuthAlert tone="success">{message}</AuthAlert>}
 
-      <form onSubmit={onSubmit} className="space-y-4">
+      <form onSubmit={onSubmit} className="space-y-3">
         <AuthField label="New password">
           <input
             type="password"
